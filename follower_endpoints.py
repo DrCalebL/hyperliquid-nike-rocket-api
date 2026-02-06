@@ -840,7 +840,7 @@ async def register_user(
         user = User(
             email=data.email,
             api_key=api_key,
-            wallet_address=data.wallet_address,
+            hl_wallet_address=data.wallet_address if data.wallet_address else None,
             access_granted=True  # Grant access immediately (30-day billing starts on first trade)
         )
         
