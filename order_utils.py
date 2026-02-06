@@ -523,6 +523,23 @@ async def notify_critical_error(error_type, error, location=None, user_api_key=N
     await notify_admin(title=f"🚨 CRITICAL ERROR: {error_type} (HL)", details=details, level="error")
 
 
+async def notify_security_alert(alert_type, details_dict=None, ip_address=None, user_agent=None):
+    """Notify admin of potential security threats (SQL injection, etc)."""
+    details = {
+        "Alert Type": alert_type,
+        "Severity": "🔴 SECURITY - Potential attack detected",
+    }
+    if ip_address:
+        details["IP Address"] = ip_address
+    if user_agent:
+        details["User Agent"] = str(user_agent)[:200]
+    if details_dict:
+        for k, v in list(details_dict.items())[:5]:
+            details[k] = str(v)[:200]
+
+    await notify_admin(title=f"🛡️ SECURITY ALERT: {alert_type} (HL)", details=details, level="error")
+
+
 async def notify_api_failure(service, endpoint, error, status_code=None, user_api_key=None, impact="Operation skipped"):
     """Notify admin when external API fails."""
     details = {"Service": service, "Endpoint": endpoint[:100], "Error": str(error)[:500], "Impact": impact}
