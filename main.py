@@ -219,6 +219,61 @@ if DATABASE_URL:
             ALTER TABLE follower_users 
             ADD COLUMN IF NOT EXISTS fee_tier VARCHAR(20) DEFAULT 'standard'
         """)
+        
+        # Create billing tables (used by asyncpg billing service)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS billing_cycles (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                cycle_start TIMESTAMP,
+                cycle_end TIMESTAMP,
+                cycle_number INTEGER DEFAULT 1,
+                total_profit NUMERIC(20,8) DEFAULT 0,
+                total_trades INTEGER DEFAULT 0,
+                fee_tier VARCHAR(20) DEFAULT 'standard',
+                fee_percentage NUMERIC(5,4) DEFAULT 0,
+                fee_amount NUMERIC(20,8) DEFAULT 0,
+                invoice_id TEXT,
+                invoice_status VARCHAR(20),
+                invoice_created_at TIMESTAMP,
+                invoice_paid_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS billing_invoices (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                billing_cycle_id INTEGER,
+                coinbase_charge_id TEXT,
+                coinbase_charge_code TEXT,
+                hosted_url TEXT,
+                amount_usd NUMERIC(20,8) DEFAULT 0,
+                profit_amount NUMERIC(20,8) DEFAULT 0,
+                fee_tier VARCHAR(20),
+                fee_percentage NUMERIC(5,4) DEFAULT 0,
+                cycle_start TIMESTAMP,
+                cycle_end TIMESTAMP,
+                expires_at TIMESTAMP,
+                status VARCHAR(20) DEFAULT 'pending',
+                paid_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # Create error_logs table (used by global exception handler)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS error_logs (
+                id SERIAL PRIMARY KEY,
+                api_key TEXT,
+                error_type TEXT,
+                error_message TEXT,
+                context TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
         conn.commit()
         cur.close()
         conn.close()
