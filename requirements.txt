@@ -1,0 +1,12 @@
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+asyncpg==0.29.0
+sqlalchemy==2.0.23
+psycopg2-binary==2.9.9
+pydantic[email]==2.5.2
+cryptography==41.0.7
+hyperliquid-python-sdk>=0.3.0
+eth-account>=0.10.0
+sendgrid==6.11.0
+python-multipart==0.0.6
+aiohttp==3.9.1
