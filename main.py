@@ -294,6 +294,12 @@ if DATABASE_URL:
             ADD COLUMN IF NOT EXISTS api_expiry_last_reminder_days INTEGER
         """)
         
+        # Add last_known_balance for portfolio tracking
+        cur.execute("""
+            ALTER TABLE follower_users 
+            ADD COLUMN IF NOT EXISTS last_known_balance NUMERIC
+        """)
+        
         conn.commit()
         cur.close()
         conn.close()
