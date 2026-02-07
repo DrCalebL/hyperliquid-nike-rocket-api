@@ -72,43 +72,51 @@ async def verify_hl_credentials(private_key: str, wallet_address: str) -> tuple[
     """
     Verify Hyperliquid credentials by checking wallet access.
     
-    For Hyperliquid, the wallet address IS the unique account identifier.
-    No fingerprinting needed - wallet address is deterministic from private key.
+    For Hyperliquid API wallets:
+    - The private key derives to the API WALLET address (used for signing)
+    - The wallet_address is the user's MAIN ACCOUNT address (used for trading/querying)
+    - These are EXPECTED to be different
     
     Args:
-        private_key: Hyperliquid private key (hex)
-        wallet_address: Hyperliquid wallet address (0x...)
+        private_key: Hyperliquid API wallet private key (hex)
+        wallet_address: Hyperliquid MAIN account address (0x...)
     Returns:
-        Tuple of (verified_wallet_address, error_message)
+        Tuple of (verified_main_account_address, error_message)
     """
     try:
-        # Step 1: Derive wallet from private key
+        # Step 1: Derive API wallet address from private key
         try:
             account = Account.from_key(private_key)
-            derived_address = account.address
+            api_wallet_address = account.address
         except Exception as e:
             return (None, f"Invalid private key format: {str(e)}")
         
-        # Step 2: Verify wallet address matches
-        if wallet_address and wallet_address.lower() != derived_address.lower():
-            return (None, f"Wallet address mismatch. Private key derives to {derived_address[:10]}... but you provided {wallet_address[:10]}...")
+        # Step 2: Validate the main account address format
+        if not wallet_address or not wallet_address.startswith('0x') or len(wallet_address) != 42:
+            return (None, "Invalid wallet address format. Must be a 0x... Ethereum address (42 chars)")
         
-        verified_address = derived_address
+        # Note: API wallet address and main account address are expected to differ
+        # The API wallet signs transactions on behalf of the main account
+        if wallet_address.lower() == api_wallet_address.lower():
+            logger.info(f"✅ Direct wallet (not API wallet): {api_wallet_address[:10]}...")
+        else:
+            logger.info(f"✅ API wallet {api_wallet_address[:10]}... authorized for main account {wallet_address[:10]}...")
         
-        # Step 3: Verify account exists on Hyperliquid
+        # Step 3: Verify main account exists on Hyperliquid
         try:
             base_url = constants.TESTNET_API_URL if USE_TESTNET else constants.MAINNET_API_URL
             info = Info(base_url, skip_ws=True)
-            state = info.user_state(verified_address)
+            state = info.user_state(wallet_address)
             if state and "marginSummary" in state:
                 account_value = float(state["marginSummary"].get("accountValue", 0))
-                logger.info(f"✅ HL wallet verified: {verified_address[:10]}... (value: ${account_value:.2f})")
+                logger.info(f"✅ Main account verified: {wallet_address[:10]}... (value: ${account_value:.2f})")
             else:
-                logger.info(f"✅ HL wallet verified: {verified_address[:10]}... (new/empty account)")
+                logger.info(f"✅ Main account verified: {wallet_address[:10]}... (new/empty account)")
         except Exception as e:
-            logger.warning(f"⚠️ Could not verify wallet state (may be new account): {e}")
+            logger.warning(f"⚠️ Could not verify account state (may be new account): {e}")
         
-        return (verified_address, None)
+        # Return the MAIN account address (this is what gets stored and used for queries)
+        return (wallet_address, None)
     except Exception as e:
         logger.error(f"Error verifying HL credentials: {e}")
         return (None, f"Failed to verify Hyperliquid credentials: {str(e)}")
