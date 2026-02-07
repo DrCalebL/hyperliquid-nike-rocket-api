@@ -300,6 +300,113 @@ async def initialize_portfolio_autodetect(request: Request):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get("/api/portfolio/balance-summary")
+async def get_balance_summary(request: Request):
+    """
+    Get portfolio balance summary for the dashboard overview cards.
+    Returns current value, initial capital, deposits/withdrawals, ROI, and profit.
+    """
+    api_key = request.headers.get("X-API-Key") or request.query_params.get("key")
+    
+    if not api_key:
+        raise HTTPException(status_code=401, detail="API key required")
+    
+    try:
+        await validate_api_key(api_key)
+        
+        DATABASE_URL = os.getenv("DATABASE_URL")
+        if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
+            DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+        
+        conn = await asyncpg.connect(DATABASE_URL)
+        
+        try:
+            # Get user info
+            user_info = await conn.fetchrow("""
+                SELECT initial_capital, last_known_balance, hl_wallet_address, 
+                       started_tracking_at, created_at
+                FROM follower_users WHERE api_key = $1
+            """, api_key)
+            
+            if not user_info or not user_info['initial_capital']:
+                return {"status": "no_data", "message": "Portfolio not initialized"}
+            
+            initial_capital = float(user_info['initial_capital'] or 0)
+            wallet_address = user_info.get('hl_wallet_address')
+            
+            # Try to get live balance from HL
+            current_value = float(user_info['last_known_balance'] or 0)
+            last_balance_check = None
+            
+            if wallet_address:
+                try:
+                    live_balance = await get_current_hl_balance(wallet_address, api_key)
+                    if live_balance is not None:
+                        current_value = live_balance
+                        last_balance_check = datetime.utcnow().isoformat()
+                        # Update last_known_balance
+                        await conn.execute(
+                            "UPDATE follower_users SET last_known_balance = $1 WHERE api_key = $2",
+                            current_value, api_key
+                        )
+                except Exception as e:
+                    print(f"Could not fetch live balance: {e}")
+            
+            # Get deposit/withdrawal totals
+            txn_totals = await conn.fetchrow("""
+                SELECT 
+                    COALESCE(SUM(CASE WHEN transaction_type = 'deposit' THEN amount ELSE 0 END), 0) as total_deposits,
+                    COALESCE(SUM(CASE WHEN transaction_type = 'withdrawal' THEN amount ELSE 0 END), 0) as total_withdrawals
+                FROM portfolio_transactions
+                WHERE user_id = $1
+            """, api_key)
+            
+            total_deposits = float(txn_totals['total_deposits']) if txn_totals else 0
+            total_withdrawals = float(txn_totals['total_withdrawals']) if txn_totals else 0
+            net_deposits = total_deposits - total_withdrawals
+            
+            # Total capital = initial + net deposits
+            total_capital = initial_capital + net_deposits
+            
+            # Total profit = current value - total capital
+            total_profit = current_value - total_capital
+            
+            # ROI calculations
+            roi_on_initial = (total_profit / initial_capital * 100) if initial_capital > 0 else 0
+            roi_on_total = (total_profit / total_capital * 100) if total_capital > 0 else 0
+            
+            # Get last snapshot time
+            if not last_balance_check:
+                last_snap = await conn.fetchrow("""
+                    SELECT recorded_at FROM portfolio_snapshots 
+                    WHERE follower_user_id = (SELECT id FROM follower_users WHERE api_key = $1)
+                    ORDER BY recorded_at DESC LIMIT 1
+                """, api_key)
+                if last_snap:
+                    last_balance_check = last_snap['recorded_at'].isoformat()
+            
+            return {
+                "status": "success",
+                "current_value": round(current_value, 2),
+                "initial_capital": round(initial_capital, 2),
+                "net_deposits": round(net_deposits, 2),
+                "total_profit": round(total_profit, 2),
+                "total_deposits": round(total_deposits, 2),
+                "total_withdrawals": round(total_withdrawals, 2),
+                "total_capital": round(total_capital, 2),
+                "roi_on_initial": round(roi_on_initial, 2),
+                "roi_on_total": round(roi_on_total, 2),
+                "last_balance_check": last_balance_check
+            }
+        finally:
+            await conn.close()
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/api/portfolio/stats")
 async def get_portfolio_stats(request: Request, period: str = "30d"):
     """

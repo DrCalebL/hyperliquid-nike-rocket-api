@@ -220,12 +220,21 @@ class HostedTradingLoop:
         if not private_key:
             raise ValueError(f"Failed to decrypt credentials for user {api_key[:15]}...")
         
-        # Derive wallet address
+        # Derive API wallet address from private key
         account = Account.from_key(private_key)
-        wallet_address = user.get('hl_wallet_address') or account.address
+        api_wallet_address = account.address
+        
+        # Main account address (what we query balances/positions for)
+        # For API wallets, this differs from the derived address
+        wallet_address = user.get('hl_wallet_address') or api_wallet_address
         
         # Create exchange instance
-        exchange = Exchange(account, self.base_url)
+        # If API wallet differs from main account, pass account_address
+        # so the SDK knows to trade on behalf of the main account
+        if wallet_address.lower() != api_wallet_address.lower():
+            exchange = Exchange(account, self.base_url, account_address=wallet_address)
+        else:
+            exchange = Exchange(account, self.base_url)
         
         # Cache it
         self.active_exchanges[api_key] = (self.info, exchange, wallet_address)

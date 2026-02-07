@@ -123,12 +123,10 @@ class BalanceChecker:
             wallet_address = user.get('hl_wallet_address')
             
             if not wallet_address:
-                # Derive from private key
-                private_key = decrypt_private_key(user['hl_private_key_encrypted'])
-                if not private_key:
-                    return
-                account = Account.from_key(private_key)
-                wallet_address = account.address
+                # Cannot derive main account address from API wallet private key
+                # (API wallet derives to a different address than the main account)
+                logger.warning(f"⚠️ No wallet address stored for {user_short} - skipping balance check")
+                return
             
             # Get current balance from HL
             state = self.info.user_state(wallet_address)

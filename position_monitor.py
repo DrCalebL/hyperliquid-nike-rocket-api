@@ -112,8 +112,16 @@ class PositionMonitor:
                 return None
             
             account = Account.from_key(private_key)
-            wallet_address = hl_wallet_address or account.address
-            exchange = Exchange(account, self.base_url)
+            api_wallet_address = account.address
+            
+            # Main account address (what we query balances/positions for)
+            wallet_address = hl_wallet_address or api_wallet_address
+            
+            # If API wallet differs from main account, pass account_address
+            if wallet_address.lower() != api_wallet_address.lower():
+                exchange = Exchange(account, self.base_url, account_address=wallet_address)
+            else:
+                exchange = Exchange(account, self.base_url)
             
             result = (self.info, exchange, wallet_address)
             self.active_exchanges[user_api_key] = result
