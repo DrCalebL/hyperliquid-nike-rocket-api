@@ -1637,6 +1637,10 @@ def generate_admin_html(users: List[Dict], errors: List[Dict], stats: Dict, revi
                             style="padding: 8px 20px; background: #667eea; color: white; border: none; border-radius: 6px; cursor: pointer; font-weight: 600; white-space: nowrap;">
                             💾 Save
                         </button>
+                        <button onclick="forceExpiryCheck()" 
+                            style="padding: 8px 20px; background: #f59e0b; color: #1e293b; border: none; border-radius: 6px; cursor: pointer; font-weight: 600; white-space: nowrap;">
+                            🧪 Test Check Now
+                        </button>
                     </div>
                     <div id="vaultUpdateResult" style="margin-top: 8px; font-size: 13px;"></div>
                 </div>
@@ -2230,6 +2234,27 @@ def generate_admin_html(users: List[Dict], errors: List[Dict], stats: Dict, revi
                 setTimeout(loadExpiryStatus, 1000);
             }} else {{
                 resultDiv.innerHTML = `<span style="color: #ef4444;">❌ ${{data.detail || data.error || 'Failed'}}</span>`;
+            }}
+        }} catch (err) {{
+            resultDiv.innerHTML = `<span style="color: #ef4444;">❌ Error: ${{err.message}}</span>`;
+        }}
+    }}
+    
+    async function forceExpiryCheck() {{
+        const resultDiv = document.getElementById('vaultUpdateResult');
+        resultDiv.innerHTML = '<span style="color: #f59e0b;">⏳ Running expiry check & sending emails...</span>';
+        
+        try {{
+            const response = await fetch(`/admin/api-expiry/check-now?password=${{'{ADMIN_PASSWORD}'}}`, {{
+                method: 'POST'
+            }});
+            const data = await response.json();
+            
+            if (data.status === 'success') {{
+                resultDiv.innerHTML = `<span style="color: #10b981;">✅ ${{data.message}}</span>`;
+                setTimeout(loadExpiryStatus, 1000);
+            }} else {{
+                resultDiv.innerHTML = `<span style="color: #ef4444;">❌ ${{data.detail || 'Failed'}}</span>`;
             }}
         }} catch (err) {{
             resultDiv.innerHTML = `<span style="color: #ef4444;">❌ Error: ${{err.message}}</span>`;
