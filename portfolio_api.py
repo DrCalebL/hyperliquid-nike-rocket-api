@@ -982,3 +982,329 @@ async def export_monthly_trades(request: Request, key: str, year: int, month: in
     except Exception as e:
         print(f"Error exporting monthly trades: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================
+# MISSING ENDPOINTS - Transactions, Yearly CSV, Deposit/Withdraw
+# ============================================================
+
+@router.get("/api/portfolio/transactions")
+async def get_transactions(request: Request, key: str = "", limit: int = 20, offset: int = 0, start_date: str = None, end_date: str = None):
+    """
+    Get paginated portfolio transactions (deposits, withdrawals, fees).
+    Dashboard calls: /api/portfolio/transactions?key=...&limit=20&offset=0
+    Expected response: { status: 'success', transactions: [...] }
+    Each tx needs: created_at, transaction_type, amount, detection_method
+    """
+    api_key = request.headers.get("X-API-Key") or key
+    
+    if not api_key:
+        raise HTTPException(status_code=401, detail="API key required")
+    
+    DATABASE_URL = os.getenv("DATABASE_URL")
+    if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
+        DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+    
+    try:
+        conn = await asyncpg.connect(DATABASE_URL)
+        
+        try:
+            user = await conn.fetchrow(
+                "SELECT id FROM follower_users WHERE api_key = $1",
+                api_key
+            )
+            
+            if not user:
+                await conn.close()
+                raise HTTPException(status_code=404, detail="User not found")
+            
+            # Build query with optional date filters
+            query = """
+                SELECT id, transaction_type, amount, detection_method, detected_at, notes
+                FROM portfolio_transactions
+                WHERE follower_user_id = $1
+            """
+            params = [user['id']]
+            param_idx = 2
+            
+            if start_date:
+                try:
+                    sd = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
+                    query += f" AND detected_at >= ${param_idx}"
+                    params.append(sd)
+                    param_idx += 1
+                except ValueError:
+                    pass
+            
+            if end_date:
+                try:
+                    ed = datetime.fromisoformat(end_date.replace('Z', '+00:00'))
+                    query += f" AND detected_at <= ${param_idx}"
+                    params.append(ed)
+                    param_idx += 1
+                except ValueError:
+                    pass
+            
+            query += f" ORDER BY detected_at DESC LIMIT ${param_idx} OFFSET ${param_idx + 1}"
+            params.extend([limit, offset])
+            
+            rows = await conn.fetch(query, *params)
+            
+            transactions = []
+            for row in rows:
+                transactions.append({
+                    "id": row['id'],
+                    "transaction_type": row['transaction_type'],
+                    "amount": float(row['amount']) if row['amount'] else 0.0,
+                    "detection_method": row['detection_method'] or "automatic",
+                    "created_at": row['detected_at'].isoformat() if row['detected_at'] else None,
+                    "notes": row['notes']
+                })
+            
+            return {
+                "status": "success",
+                "transactions": transactions,
+                "offset": offset,
+                "limit": limit
+            }
+        
+        finally:
+            await conn.close()
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error in transactions endpoint: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/api/portfolio/trades/yearly-csv")
+async def export_yearly_trades(request: Request, key: str = "", year: int = 2026):
+    """
+    Export yearly trades as CSV.
+    Dashboard calls: /api/portfolio/trades/yearly-csv?key=...&year=2026
+    """
+    api_key = request.headers.get("X-API-Key") or key
+    
+    if not api_key:
+        raise HTTPException(status_code=401, detail="API key required")
+    
+    DATABASE_URL = os.getenv("DATABASE_URL")
+    if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
+        DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+    
+    try:
+        conn = await asyncpg.connect(DATABASE_URL)
+        
+        user = await conn.fetchrow(
+            "SELECT id, email, fee_tier FROM follower_users WHERE api_key = $1",
+            api_key
+        )
+        
+        if not user:
+            await conn.close()
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        start_date = datetime(year, 1, 1)
+        end_date = datetime(year + 1, 1, 1)
+        
+        trades = await conn.fetch("""
+            SELECT closed_at, symbol, side, entry_price, exit_price,
+                   position_size, leverage, profit_usd, profit_percent, notes
+            FROM trades
+            WHERE user_id = $1 AND closed_at >= $2 AND closed_at < $3
+            ORDER BY closed_at ASC
+        """, user['id'], start_date, end_date)
+        
+        await conn.close()
+        
+        output = io.StringIO()
+        writer = csv.writer(output)
+        
+        writer.writerow([f"Trade History - {year} (Hyperliquid)"])
+        writer.writerow([f"User: {user['email']}"])
+        writer.writerow([f"Fee Tier: {user['fee_tier'] or 'standard'}"])
+        writer.writerow([])
+        writer.writerow(['Date (UTC)', 'Symbol', 'Side', 'Entry Price', 'Exit Price',
+                         'Position Size', 'Leverage', 'P&L ($)', 'P&L (%)', 'Notes'])
+        
+        total_pnl = 0
+        winning_trades = 0
+        losing_trades = 0
+        monthly_pnl = {}
+        
+        for trade in trades:
+            pnl = float(trade['profit_usd'] or 0)
+            total_pnl += pnl
+            if pnl >= 0:
+                winning_trades += 1
+            else:
+                losing_trades += 1
+            
+            if trade['closed_at']:
+                month_key = trade['closed_at'].strftime('%Y-%m')
+                monthly_pnl[month_key] = monthly_pnl.get(month_key, 0) + pnl
+            
+            writer.writerow([
+                trade['closed_at'].strftime('%Y-%m-%d %H:%M:%S') if trade['closed_at'] else '',
+                trade['symbol'] or '',
+                trade['side'] or '',
+                f"{float(trade['entry_price'] or 0):.6f}",
+                f"{float(trade['exit_price'] or 0):.6f}",
+                f"{float(trade['position_size'] or 0):.4f}",
+                f"{int(trade['leverage'] or 1)}x",
+                f"${pnl:+.2f}",
+                f"{float(trade['profit_percent'] or 0):+.2f}%",
+                trade['notes'] or ''
+            ])
+        
+        writer.writerow([])
+        writer.writerow(['YEARLY SUMMARY'])
+        writer.writerow(['Total Trades', len(trades)])
+        writer.writerow(['Winning', winning_trades])
+        writer.writerow(['Losing', losing_trades])
+        writer.writerow(['Win Rate', f"{(winning_trades/len(trades)*100):.1f}%" if trades else "N/A"])
+        writer.writerow(['NET P&L', f"${total_pnl:+.2f}"])
+        
+        if monthly_pnl:
+            writer.writerow([])
+            writer.writerow(['MONTHLY BREAKDOWN'])
+            writer.writerow(['Month', 'P&L ($)'])
+            for month, pnl in sorted(monthly_pnl.items()):
+                writer.writerow([month, f"${pnl:+.2f}"])
+        
+        fee_rates = {'team': 0.0, 'vip': 0.05, 'standard': 0.10}
+        fee_rate = fee_rates.get(user['fee_tier'] or 'standard', 0.10)
+        fee_due = max(0, total_pnl * fee_rate) if total_pnl > 0 else 0
+        writer.writerow([])
+        writer.writerow(['Fee Rate', f"{int(fee_rate * 100)}%"])
+        writer.writerow(['Total Fee Due', f"${fee_due:.2f}"])
+        
+        output.seek(0)
+        filename = f"hl_trades_{year}_{user['email'].split('@')[0]}.csv"
+        
+        return StreamingResponse(
+            iter([output.getvalue()]),
+            media_type="text/csv",
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
+        )
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error exporting yearly trades: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/api/portfolio/deposit")
+async def record_deposit(request: Request):
+    """
+    Manually record a deposit to adjust portfolio tracking.
+    Body: { key: "...", amount: 100.0, notes: "optional" }
+    """
+    body = await request.json()
+    api_key = body.get("key") or request.headers.get("X-API-Key")
+    amount = body.get("amount")
+    notes = body.get("notes", "Manual deposit")
+    
+    if not api_key:
+        raise HTTPException(status_code=401, detail="API key required")
+    if not amount or float(amount) <= 0:
+        raise HTTPException(status_code=400, detail="Positive amount required")
+    
+    DATABASE_URL = os.getenv("DATABASE_URL")
+    if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
+        DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+    
+    try:
+        conn = await asyncpg.connect(DATABASE_URL)
+        
+        try:
+            user = await conn.fetchrow(
+                "SELECT id FROM follower_users WHERE api_key = $1",
+                api_key
+            )
+            
+            if not user:
+                await conn.close()
+                raise HTTPException(status_code=404, detail="User not found")
+            
+            await conn.execute("""
+                INSERT INTO portfolio_transactions 
+                    (follower_user_id, user_id, transaction_type, amount, detection_method, detected_at, notes)
+                VALUES ($1, $2, 'deposit', $3, 'manual', NOW(), $4)
+            """, user['id'], api_key, float(amount), notes)
+            
+            return {
+                "status": "success",
+                "message": f"Deposit of ${float(amount):.2f} recorded",
+                "transaction_type": "deposit",
+                "amount": float(amount)
+            }
+        
+        finally:
+            await conn.close()
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error recording deposit: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/api/portfolio/withdraw")
+async def record_withdrawal(request: Request):
+    """
+    Manually record a withdrawal to adjust portfolio tracking.
+    Body: { key: "...", amount: 50.0, notes: "optional" }
+    """
+    body = await request.json()
+    api_key = body.get("key") or request.headers.get("X-API-Key")
+    amount = body.get("amount")
+    notes = body.get("notes", "Manual withdrawal")
+    
+    if not api_key:
+        raise HTTPException(status_code=401, detail="API key required")
+    if not amount or float(amount) <= 0:
+        raise HTTPException(status_code=400, detail="Positive amount required")
+    
+    DATABASE_URL = os.getenv("DATABASE_URL")
+    if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
+        DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+    
+    try:
+        conn = await asyncpg.connect(DATABASE_URL)
+        
+        try:
+            user = await conn.fetchrow(
+                "SELECT id FROM follower_users WHERE api_key = $1",
+                api_key
+            )
+            
+            if not user:
+                await conn.close()
+                raise HTTPException(status_code=404, detail="User not found")
+            
+            await conn.execute("""
+                INSERT INTO portfolio_transactions 
+                    (follower_user_id, user_id, transaction_type, amount, detection_method, detected_at, notes)
+                VALUES ($1, $2, 'withdrawal', $3, 'manual', NOW(), $4)
+            """, user['id'], api_key, float(amount), notes)
+            
+            return {
+                "status": "success",
+                "message": f"Withdrawal of ${float(amount):.2f} recorded",
+                "transaction_type": "withdrawal",
+                "amount": float(amount)
+            }
+        
+        finally:
+            await conn.close()
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error recording withdrawal: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
