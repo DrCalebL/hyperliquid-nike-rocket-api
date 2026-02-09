@@ -464,8 +464,21 @@ class HostedTradingLoop:
             user_email = user.get('email', 'unknown')
             
             # 1. Entry IOC order (market-like with slippage)
+            # Use LIVE mid price for IOC limit, not stale signal entry price
+            try:
+                all_mids = info.all_mids()
+                live_price = float(all_mids.get(coin, 0))
+                if live_price <= 0:
+                    self.logger.warning(f"   ⚠️ Could not fetch live price for {coin}, falling back to signal entry")
+                    live_price = entry_price
+                else:
+                    self.logger.info(f"   📊 Live mid price: ${live_price:.6f} (signal entry: ${entry_price:.6f})")
+            except Exception as e:
+                self.logger.warning(f"   ⚠️ Live price fetch failed: {e}, using signal entry")
+                live_price = entry_price
+            
             slippage_mult = 1 + (SLIPPAGE_BPS / 10000) if is_buy else 1 - (SLIPPAGE_BPS / 10000)
-            entry_limit_price = self.round_price(entry_price * slippage_mult)
+            entry_limit_price = self.round_price(live_price * slippage_mult)
             
             self.logger.info(f"   📝 Placing entry IOC order...")
             entry_order = await place_entry_order_with_retry(
