@@ -247,7 +247,7 @@ async def place_tp_order_with_retry(
             
             result = exchange.order(
                 coin, is_buy, quantity, tp_price,
-                {"trigger": {"isMarket": False, "triggerPx": str(tp_price), "tpsl": "tp"}},
+                {"trigger": {"isMarket": False, "triggerPx": tp_price, "tpsl": "tp"}},
                 reduce_only=True
             )
             
@@ -325,7 +325,7 @@ async def place_sl_order_with_retry(
             
             result = exchange.order(
                 coin, is_buy, quantity, sl_price,
-                {"trigger": {"isMarket": True, "triggerPx": str(sl_price), "tpsl": "sl"}},
+                {"trigger": {"isMarket": True, "triggerPx": sl_price, "tpsl": "sl"}},
                 reduce_only=True
             )
             
