@@ -5341,9 +5341,9 @@ async def startup_event():
                     await conn.execute("""
                         ALTER TABLE error_logs ALTER COLUMN created_at SET DEFAULT CURRENT_TIMESTAMP
                     """)
-                    # Backfill any NULL timestamps
+                    # Backfill any NULL timestamps (30 days ago so they don't inflate recent counts)
                     await conn.execute("""
-                        UPDATE error_logs SET created_at = NOW() WHERE created_at IS NULL
+                        UPDATE error_logs SET created_at = NOW() - INTERVAL '30 days' WHERE created_at IS NULL
                     """)
                 print("✅ Async defensive migrations complete")
             except Exception as e:
