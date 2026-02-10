@@ -95,9 +95,9 @@ def create_error_logs_table():
     cur.execute("CREATE INDEX IF NOT EXISTS idx_agent_logs_timestamp ON agent_logs(timestamp DESC)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_trades_closed_at ON trades(closed_at DESC)")
     
-    # Backfill NULL timestamps in error_logs
+    # Backfill NULL timestamps in error_logs (use 30 days ago so they don't inflate recent counts)
     try:
-        cur.execute("UPDATE error_logs SET created_at = NOW() WHERE created_at IS NULL")
+        cur.execute("UPDATE error_logs SET created_at = NOW() - INTERVAL '30 days' WHERE created_at IS NULL")
     except Exception:
         pass
     
