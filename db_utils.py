@@ -53,7 +53,7 @@ if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
 # Resend email configuration
 RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
 RESEND_API_URL = "https://api.resend.com/emails"
-FROM_EMAIL = os.getenv("FROM_EMAIL", "$NIKEPIG's Massive Rocket <onboarding@resend.dev>")
+FROM_EMAIL = os.getenv("FROM_EMAIL", "$NIKEPIG's Massive Rocket <noreply@rocket.nikepig.com>")
 ADMIN_EMAIL = get_admin_email()
 
 # Global pool reference
@@ -115,7 +115,7 @@ async def notify_db_failure(error_type: str, error_message: str, context: Option
         </table>
         
         <p style="color: #999; font-size: 12px; margin-top: 20px;">
-            This is an automated notification from Nike Rocket trading system.
+            This is an automated notification from noreply@rocket.nikepig.com.
         </p>
     </body>
     </html>

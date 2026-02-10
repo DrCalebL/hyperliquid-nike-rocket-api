@@ -34,7 +34,7 @@ MAX_BACKOFF = 8.0  # seconds
 # Resend email configuration
 RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
 RESEND_API_URL = "https://api.resend.com/emails"
-FROM_EMAIL = os.getenv("FROM_EMAIL", "$NIKEPIG's Massive Rocket <onboarding@resend.dev>")
+FROM_EMAIL = os.getenv("FROM_EMAIL", "$NIKEPIG's Massive Rocket <noreply@rocket.nikepig.com>")
 ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "calebws87@gmail.com")
 
 
@@ -89,7 +89,7 @@ async def notify_admin(
         </table>
         
         <p style="color: #999; font-size: 12px; margin-top: 20px;">
-            This is an automated notification from Nike Rocket Hyperliquid trading system.
+            This is an automated notification from noreply@rocket.nikepig.com.
         </p>
     </body>
     </html>

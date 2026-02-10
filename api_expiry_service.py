@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 # ═══════════════════════════════════════════════════════════════════════════
 RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
 RESEND_API_URL = "https://api.resend.com/emails"
-FROM_EMAIL = os.getenv("FROM_EMAIL", "$NIKEPIG's Massive Rocket <onboarding@resend.dev>")
+FROM_EMAIL = os.getenv("FROM_EMAIL", "$NIKEPIG's Massive Rocket <noreply@rocket.nikepig.com>")
 ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "calebws87@gmail.com")
 SITE_URL = os.getenv("SITE_URL", "https://rocket-hla.nikepig.com")
 
@@ -64,7 +64,7 @@ def _vault_leader_email_html(days_left: int, expiry_date: str) -> str:
             <li>Update the private key in your vault bot environment</li>
             <li>Update the expiry date: <code>POST {SITE_URL}/admin/api-expiry/vault</code></li>
         </ol>
-        <p style="color: #6b7280; font-size: 12px;">This is an automated reminder from Nike Rocket.</p>
+        <p style="color: #6b7280; font-size: 12px;">This is an automated reminder from noreply@rocket.nikepig.com.</p>
     </div>
     """
 
