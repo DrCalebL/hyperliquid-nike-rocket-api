@@ -249,9 +249,13 @@
         .checklist-item input[type="checkbox"] {
             margin-right: 10px;
             margin-top: 2px;
-            width: 18px;
-            height: 18px;
+            width: 16px;
+            height: 16px;
+            min-width: 16px;
+            min-height: 16px;
+            flex-shrink: 0;
             cursor: pointer;
+            accent-color: #22c55e;
         }
         
         .checklist-item label {
@@ -368,7 +372,7 @@
             <strong>✅ Before You Begin - Quick Checklist</strong>
             <div class="checklist-item">
                 <input type="checkbox" id="check1">
-                <label for="check1">Hyperliquid account created at <a href="https://app.hyperliquid.xyz" target="_blank" class="link">app.hyperliquid.xyz</a></label>
+                <label for="check1">Wallet connected at <a href="https://app.hyperliquid.xyz" target="_blank" class="link">app.hyperliquid.xyz</a> — compatible wallets: MetaMask, Coinbase Wallet, OKX Wallet, Rabby, Trust Wallet, or any WalletConnect wallet. You can also sign up with email.</label>
             </div>
             <div class="checklist-item">
                 <input type="checkbox" id="check2">
@@ -447,9 +451,7 @@
 
         <div class="warning-box">
             <strong>🔒 Security Notice</strong>
-            <p>Your API wallet private key is encrypted using military-grade AES-256 encryption. We never have access to your raw keys.</p>
-            <p>API wallets <strong>cannot withdraw funds</strong> — they can only trade. You can revoke access anytime by deleting the API wallet on Hyperliquid.</p>
-            <p>API wallets expire after the duration you set (max 180 days). You'll need to re-authorize before it expires to keep trading.</p>
+            <p>Your API wallet private key is encrypted using military-grade AES-256 encryption. We never have access to your raw keys. API wallets <strong>cannot withdraw funds</strong> — they can only trade. You can revoke access anytime by deleting the API wallet on Hyperliquid. API wallets expire after the duration you set (max 180 days). You'll need to re-authorize before it expires to keep trading.</p>
         </div>
         
         <div class="input-group">
