@@ -333,6 +333,21 @@ if DATABASE_URL:
             except Exception:
                 conn.rollback()
         
+        # Fix NULL detected_at for initial deposits (set to created_at or user's tracking start)
+        try:
+            cur.execute("""
+                UPDATE portfolio_transactions pt
+                SET detected_at = COALESCE(
+                    (SELECT fu.started_tracking_at FROM follower_users fu WHERE fu.id = pt.follower_user_id),
+                    (SELECT fu.created_at FROM follower_users fu WHERE fu.id = pt.follower_user_id),
+                    NOW()
+                )
+                WHERE pt.detected_at IS NULL
+            """)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+        
         # Add unique constraint for ON CONFLICT in position_monitor
         try:
             cur.execute("""
