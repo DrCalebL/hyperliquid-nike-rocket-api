@@ -275,8 +275,8 @@ async def initialize_portfolio_autodetect(request: Request):
         
         await conn.execute("""
             INSERT INTO portfolio_transactions (
-                follower_user_id, user_id, transaction_type, amount, detection_method, notes
-            ) VALUES ($1, $2, 'initial', $3, 'automatic', $4)
+                follower_user_id, user_id, transaction_type, amount, detection_method, detected_at, notes
+            ) VALUES ($1, $2, 'initial', $3, 'automatic', NOW(), $4)
         """, user_id, api_key, initial_capital,
             f'Auto-detected from Hyperliquid balance: ${initial_capital:,.2f}')
         
@@ -1045,7 +1045,7 @@ async def get_transactions(request: Request, key: str = "", limit: int = 20, off
                 except ValueError:
                     pass
             
-            query += f" ORDER BY detected_at DESC LIMIT ${param_idx} OFFSET ${param_idx + 1}"
+            query += f" ORDER BY detected_at DESC NULLS LAST LIMIT ${param_idx} OFFSET ${param_idx + 1}"
             params.extend([limit, offset])
             
             rows = await conn.fetch(query, *params)
@@ -1057,7 +1057,7 @@ async def get_transactions(request: Request, key: str = "", limit: int = 20, off
                     "transaction_type": row['transaction_type'],
                     "amount": float(row['amount']) if row['amount'] else 0.0,
                     "detection_method": row['detection_method'] or "automatic",
-                    "created_at": row['detected_at'].isoformat() if row['detected_at'] else None,
+                    "created_at": (row['detected_at'].isoformat() + 'Z') if row['detected_at'] else None,
                     "notes": row['notes']
                 })
             
