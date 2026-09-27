@@ -3,6 +3,19 @@
 > Keep this file lean (it loads into every session). Detailed change history lives in
 > `docs/progress/` — read those on demand, don't paste them here.
 
+<!-- FULL-WORKFLOW:START -->
+## Full workflow (Opus 5.5, multi-agent)
+Before each wave, reread root `CLAUDE.md`. The coordinator and every worker run Claude Opus 5.5 (`claude-opus-5-5`).
+Routine work: the coordinator builds, then one fresh, independent, read-only reviewer checks it.
+"Full workflow" (high-risk or explicitly requested) runs five stages in order, scaled to the task:
+1. **Plan** — several independent planners converge on an exact consensus spec BEFORE any code.
+2. **Build** — builders implement strictly to the spec (disjoint files, or worktrees where they would overlap).
+3. **Review** — fresh adversarial reviewers on independent lenses (correctness, coverage, regression, security/money-safety, voice).
+4. **QC** — the coordinator re-verifies every finding, fixes each worth fixing (nits too when cheap and correct), reruns affected gates, and sends material fixes to fresh review.
+5. **Deliver** — CLAUDE.md for durable facts only + a dated `docs/progress/` entry; commit, fetch, rebase on current `origin/main`, rerun gates, push only the feature branch (`--force-with-lease` only after rewriting a published branch).
+Keep this block identical in the root `CLAUDE.md` of all four rocket repos (massive-rocket-algos, kraken-nike-rocket-api, hyperliquid-nike-rocket-api, hyperliquid-vault-rocket-api) and log each touched repo in its `docs/progress/`.
+<!-- FULL-WORKFLOW:END -->
+
 ## What this is
 The **follower / customer service** for $NIKEPIG's Massive Rocket. The master
 (`massive-rocket-algos`, a separate repo) trades its own account and broadcasts
@@ -38,7 +51,7 @@ accounts**. FastAPI, deployed on **Railway** (`railway.json`). **Postgres-backed
    CSS/JS brace must be **doubled** (`{{` / `}}`); `{api_key}` is the only interpolation.
    An undoubled brace either fails `py_compile` (if it forms an invalid expression) or —
    worse — silently interpolates a Python name at render and 500s `/dashboard` for
-   **every** customer. Always render-test after editing it (see workflow step 4).
+   **every** customer. Always render-test after editing it (see Gates).
 2. **Two status renderers both write `#agent-status-display`.** `displayAgentStatus`
    (lean, banner-only) runs on a **30s interval**; `checkAgentStatus` (full — also badge +
    Start/Stop buttons + details) runs on load / refresh / after start-stop. Keep their
@@ -51,28 +64,11 @@ accounts**. FastAPI, deployed on **Railway** (`railway.json`). **Postgres-backed
 4. **Customer creds are encrypted at rest** and API wallets expire (max 180d). Renewal is
    customer self-serve via `/setup?key=<nk_ key>` — the service never sees raw keys long-term.
 
-## Multi-agent development workflow (standing process for substantial changes)
-Non-trivial changes here follow a wave-based, multi-agent flow (orchestrated with the
-Workflow tool; subagents **read/design/review only** — the main session makes all edits
-and git ops so parallel agents never collide on live-money code):
-
-1. **Recon + branch.** Read the real code; create/checkout the feature branch from latest
-   `origin/main`.
-2. **Wave 1 — Plan → Consensus spec.** Parallel planners diverge (safety / UX /
-   correctness lenses) → parallel builders each draft a concrete spec → one consensus
-   agent merges into a single authoritative spec (exact files, anchors, code) with
-   conflicts resolved.
-3. **Implement** the consensus spec in the main session; respect gotcha #1.
-4. **Verify.** `python -m py_compile`; render the dashboard f-string in isolation
-   (extract via `ast`, `eval` with only `api_key` in scope — proves no stray
-   interpolation without needing the full app installed); unit-check server logic on
-   edge inputs (NULL / naive / aware / past / today / malformed).
-5. **Wave 2 — Adversarial review.** Parallel reviewers (correctness / live-money-safety /
-   UX-consistency) file findings; each finding is **independently verified by a skeptic
-   that tries to refute it**; only CONFIRMED findings survive.
-6. **QC.** Apply confirmed findings + worthwhile nits in the main session; re-verify.
-7. **Docs.** Update this file (keep lean) + a dated `docs/progress/` entry (full detail).
-8. **Rebase** the feature branch onto latest `origin/main`; push the branch. No PR unless asked.
+## Gates (this repo)
+`python -m py_compile`; render the dashboard f-string in isolation (extract via `ast`, `eval`
+with only `api_key` in scope — proves no stray interpolation without the full app installed);
+unit-check server logic on edge inputs (NULL / naive / aware / past / today / malformed).
+Review findings are verified by a skeptic that tries to refute them; only CONFIRMED ones survive.
 
 ## Conventions
 - Develop on the session's feature branch; commit + push there; **no PRs unless asked**.
