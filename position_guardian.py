@@ -51,7 +51,8 @@ import hl_rate
 from follower_guard import (ACTIVE_STATUSES, filter_actions, real_oid, rec_from_row, row_side, row_ts,
                             select_row, service_oids)
 from hosted_trading_loop import (USE_TESTNET, coin_entry_px, coin_szi, convert_symbol_to_hl,
-                                 exchange_ctor_takes_meta, hl_close_with_verification, log_error_to_db)
+                                 exchange_ctor_takes_meta, floor_to_lot, hl_close_with_verification,
+                                 log_error_to_db)
 from order_utils import cancel_order_verified, first_status, notify_admin, sl_order_type, tp_order_type
 
 logger = logging.getLogger('POSITION_GUARDIAN')
@@ -313,8 +314,7 @@ class HLPositionGuardian:
 
     def _round_size(self, coin, size):
         """Identical to HostedTradingLoop.round_size (szDecimals from meta, default 2)."""
-        factor = 10 ** self._szd.get(coin, 2)
-        return math.floor(size * factor) / factor
+        return floor_to_lot(size, self._szd.get(coin, 2))
 
     @staticmethod
     def _round_price(price, sig_figs=5):

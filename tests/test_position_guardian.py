@@ -365,6 +365,26 @@ def test_round_size_and_round_price_equal_the_trading_loops(venue, db):
     guardian._pool.shutdown(wait=False)
 
 
+def test_qc_round_size_never_shaves_a_lot_off_an_exact_lot_multiple(venue, db):
+    """QC correctness-followers-5 / money-followers-7: math.floor(0.29 * 100) / 100 == 0.28 (binary float), so an
+    exact fill size (totalSz / szi, already on the lot grid) was bracketed one lot short. Every exact k-lot size
+    must round to itself in both the trading loop and the guardian, and sizes between lots still floor."""
+    venue.meta['universe'].append({'name': 'SOL', 'szDecimals': 2})
+    venue.meta['universe'].append({'name': 'ETH', 'szDecimals': 4})
+    loop = htl.HostedTradingLoop(FakePool(db))
+    guardian = pg.HLPositionGuardian(FakePool(db))
+    guardian._szd = {a['name']: a['szDecimals'] for a in venue.meta['universe']}
+    for coin, d in (('SOL', 2), ('ETH', 4), ('BTC', 5)):
+        for k in range(1, 20001):
+            size = float('%.*f' % (d, k / 10 ** d))
+            assert loop.round_size(coin, size) == size, (coin, size)
+            assert guardian._round_size(coin, size) == size, (coin, size)
+    assert loop.round_size('SOL', 1.139) == 1.13 and guardian._round_size('SOL', 1.139) == 1.13
+    assert loop.round_size('SOL', 0.2899999) == 0.28                             # truly below 0.29: floors
+    assert loop.round_size('ADA', 4000.987) == 4000.0
+    guardian._pool.shutdown(wait=False)
+
+
 async def test_run_starts_the_lane_and_the_pass_as_separate_loops(g, monkeypatch):
     started = []
 

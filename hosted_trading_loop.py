@@ -40,6 +40,7 @@ import json
 import random
 import os
 from datetime import datetime, timedelta
+from decimal import Decimal, ROUND_DOWN
 from typing import Optional, Dict, List
 
 from hyperliquid.info import Info
@@ -110,6 +111,12 @@ def convert_symbol_to_hl(api_symbol: str) -> str:
     base = api_symbol.upper()
     base = base.replace('PF_', '').replace('USD', '').replace('USDT', '')
     return base
+
+
+def floor_to_lot(size: float, sz_decimals: int) -> float:
+    """Floor `size` to the lot grid (sz_decimals) on the float's shortest decimal repr (QC correctness-followers-5):
+    math.floor(0.29 * 100) / 100 == 0.28 in binary floats, which bracketed an exact fill one lot short."""
+    return float(Decimal(repr(float(size))).quantize(Decimal(1).scaleb(-int(sz_decimals)), rounding=ROUND_DOWN))
 
 
 def coin_szi(state, coin: str) -> float:
@@ -254,9 +261,7 @@ class HostedTradingLoop:
     def round_size(self, coin: str, size: float) -> float:
         """Round size to asset's szDecimals precision"""
         meta = self.asset_meta.get(coin, {})
-        sz_decimals = meta.get('szDecimals', 2)
-        factor = 10 ** sz_decimals
-        return math.floor(size * factor) / factor
+        return floor_to_lot(size, meta.get('szDecimals', 2))
     
     def round_price(self, price: float, sig_figs: int = 5) -> float:
         """Round price to significant figures (HL standard)"""
