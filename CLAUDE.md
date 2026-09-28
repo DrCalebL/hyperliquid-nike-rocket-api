@@ -41,8 +41,22 @@ accounts**. FastAPI, deployed on **Railway** (`railway.json`). **Postgres-backed
 - `api_expiry_service.py` — **authoritative** API-wallet expiry service: 6-hourly cron
   that emails reminders (30/14/7/3/1 days, Resend) and **deactivates** the agent on
   expiry (`days_left < 0` → `agent_active=false`). Also the admin `/admin/api-expiry/*`.
-- `hosted_trading_loop.py` — executes signals per customer. `position_monitor.py`,
-  `order_utils.py`, `price_cache.py`, `trade_reconciliation.py` support it.
+- `hosted_trading_loop.py` — executes signals per customer: IOC entry, fill confirmed from the position,
+  then **SL first**, then TP, both sized to the confirmed fill. Every failure after the entry may have filled
+  writes a `needs_recovery` row (`_record_unprotected_position`). A raised IOC is never re-sent (only a
+  definitive 4xx rejection is retried). Dedup fails closed. `position_monitor.py`, `order_utils.py`,
+  `price_cache.py`, `trade_reconciliation.py` support it.
+- `position_guardian.py` (Wave 1, started in `main.py` after the expiry checker) — two asyncio tasks:
+  the **recovery lane** (every 30 s, in **every** `GUARDIAN_MODE`, charge-only I/O) owns `needs_recovery` rows;
+  the **full pass** (every 240 s, never within 180 s of a signal) runs the two-leg invariant.
+  `GUARDIAN_MODE=off|shadow|enforce`, **default shadow** (shadow = log-only `GUARDIAN_WOULD_*`). Rowless
+  positions only alarm. Its Info/Exchange carry a 10 s timeout; a timed-out SL placement is unknown, never
+  a reason to close.
+- `hl_rate.py` — process-wide HL weight meter (one 60 s window; assumes 1 Railway replica). Full-pass reads
+  wait under `HL_WEIGHT_CEILING` (700) and `HL_GUARDIAN_WEIGHT_PER_MIN` (300); trading, monitor, mutations
+  and the lane only charge. HL's own limit is 1200/min per IP.
+- Shared Wave 1 modules: `bracket_guard.py` (byte-identical to `massive-rocket-algos`), `follower_guard.py`
+  and `signal_guard.py` (byte-identical to `kraken-nike-rocket-api`). Never edit one copy alone.
 - `config.py` — fee tiers + `utc_now()` / `ensure_utc_aware()` tz helpers.
 - HTML: `setup.html`, `signup.html`, `login.html`; the dashboard is inline in `main.py`.
 
@@ -73,12 +87,20 @@ accounts**. FastAPI, deployed on **Railway** (`railway.json`). **Postgres-backed
    entry-path rows bare (`NEEDS_RECOVERY_RECORDED`, `POSITION_RECORD_FAILED`, `EMERGENCY_CLOSE_FAILED`,
    `HL_UNEXPECTED_STATUS`, ...). Query with the stored name.
 7. **`ADMIN_PASSWORD` has no default** (SEC-3): every admin route answers 503 until it is set on Railway.
+8. **`MASTER_API_KEY` has no default** (SEC-2): `/api/broadcast-signal` answers 503 while it is unset. The
+   payload is checked by `signal_guard` (422 before any DB write; `risk_pct` required, `0 < risk_pct <= 0.03`).
+9. **HL SDK shapes:** `open_orders()` has no `reduceOnly` and returns int oids; read legs with
+   `frontend_open_orders` and compare oids as str. An envelope `status='ok'` does not mean filled: check
+   `statuses[0]`, and prove a close with a flat re-read.
 
 ## Gates (this repo)
-`python -m py_compile`; render the dashboard f-string in isolation (extract via `ast`, `eval`
-with only `api_key` in scope — proves no stray interpolation without the full app installed);
-unit-check server logic on edge inputs (NULL / naive / aware / past / today / malformed).
-Review findings are verified by a skeptic that tries to refute them; only CONFIRMED ones survive.
+- `pip install -r requirements-gate.txt` (CPython 3.13; not the production set), then `python tools/run_gates.py`
+  must print `GATES PASS` (0 failures, errors, skips; shared-file sha256 equal). Tests run offline with the
+  network blocked; fakes live in `tests/fakes/`. `tools/chaos_follower.py` is owner-run only, on HL testnet.
+- Dashboard edits: `python -m py_compile`; render the dashboard f-string in isolation (extract via `ast`, `eval`
+  with only `api_key` in scope — proves no stray interpolation without the full app installed);
+  unit-check server logic on edge inputs (NULL / naive / aware / past / today / malformed).
+- Review findings are verified by a skeptic that tries to refute them; only CONFIRMED ones survive.
 
 ## Conventions
 - Develop on the session's feature branch; commit + push there; **no PRs unless asked**.
@@ -86,4 +108,4 @@ Review findings are verified by a skeptic that tries to refute them; only CONFIR
 - Timezone-aware datetimes everywhere expiry/billing is compared (naive stored = UTC).
 
 ## History
-See `docs/progress/` (e.g. `2026-08-10-api-wallet-expiry-surfacing.md`).
+See `docs/progress/` (e.g. `2026-08-10-api-wallet-expiry-surfacing.md`, `2026-09-28-wave1-phase0-safety.md`).
