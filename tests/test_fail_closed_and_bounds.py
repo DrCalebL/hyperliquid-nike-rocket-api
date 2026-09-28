@@ -74,3 +74,91 @@ async def test_a_read_error_sends_no_entry(venue, db, creds, notes, fast_sleep):
         {'delivery_id': None, 'signal_id': s['signal_id'], 'action': 'BUY', 'symbol': 'ADA/USDT',
          'entry_price': 0.5, 'stop_loss': 0.45, 'take_profit': 0.55, 'leverage': 5.0, 'risk_pct': 0.02})
     assert ok is False and venue.order_calls() == []
+
+
+# ---------------------------------------------------------------- endpoint validation (C46)
+class _Query:
+    def filter(self, *a, **k):
+        return self
+
+    def all(self):
+        return []
+
+    def count(self):
+        return 0
+
+    def scalar(self):
+        return 0
+
+    def first(self):
+        return None
+
+
+class _Session:
+    def __init__(self):
+        self.added, self.commits = [], 0
+
+    def add(self, obj):
+        self.added.append(obj)
+
+    def commit(self):
+        self.commits += 1
+
+    def refresh(self, obj):
+        obj.id = 1
+
+    def query(self, *a):
+        return _Query()
+
+    def close(self):
+        pass
+
+
+@pytest.fixture
+def client(monkeypatch):
+    app = FastAPI()
+    app.include_router(fe.router)
+    session = _Session()
+    app.dependency_overrides[fe.get_db] = lambda: session
+    monkeypatch.setattr(fe, 'MASTER_API_KEY', 'test-master-key')
+    c = TestClient(app)
+    c.session = session
+    return c
+
+
+GOOD = {'action': 'BUY', 'symbol': 'ADA/USDT', 'entry_price': 0.5, 'stop_loss': 0.45, 'take_profit': 0.55,
+        'leverage': 5, 'risk_pct': 0.0125}
+
+
+KEY = {'x-master-key': 'test-master-key'}
+
+
+@pytest.mark.parametrize('risk', [0.01, 0.0125, 0.02, 0.025, 0.03])
+def test_broadcast_accepts_every_master_fraction(client, risk):
+    r = client.post('/api/broadcast-signal', json=dict(GOOD, risk_pct=risk), headers=KEY)
+    assert r.status_code == 200, r.text
+    assert len(client.session.added) == 1 and client.session.added[0].risk_pct == risk
+
+
+@pytest.mark.parametrize('change', [
+    {'risk_pct': 0}, {'risk_pct': 0.05}, {'risk_pct': -0.01},
+    {'stop_loss': 0.6}, {'take_profit': 0.4}, {'action': 'SELL'}, {'leverage': 0}, {'leverage': 100},
+    {'action': 'HOLD'}])
+def test_broadcast_rejects_invalid_payloads_with_422_before_any_db_write(client, change):
+    r = client.post('/api/broadcast-signal', json=dict(GOOD, **change), headers=KEY)
+    assert r.status_code == 422, r.text
+    assert client.session.added == [] and client.session.commits == 0
+
+
+def test_broadcast_rejects_a_nan_risk_pct_with_422(client):
+    body = '{"action": "BUY", "symbol": "ADA/USDT", "entry_price": 0.5, "stop_loss": 0.45, "take_profit": 0.55, '            '"leverage": 5, "risk_pct": NaN}'
+    r = client.post('/api/broadcast-signal', content=body, headers=dict(KEY, **{'content-type': 'application/json'}))
+    assert r.status_code == 422
+    assert client.session.added == []
+
+
+def test_broadcast_rejects_a_missing_risk_pct_with_422(client):
+    payload = {k: v for k, v in GOOD.items() if k != 'risk_pct'}
+    r = client.post('/api/broadcast-signal', json=payload, headers=KEY)
+    assert r.status_code == 422
+    assert client.session.added == []

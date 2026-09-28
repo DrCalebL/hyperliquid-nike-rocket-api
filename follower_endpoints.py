@@ -38,6 +38,8 @@ from hyperliquid.info import Info
 from hyperliquid.utils import constants
 from eth_account import Account
 
+import signal_guard
+
 from follower_models import (
     User, Signal, SignalDelivery, Trade, Payment, SystemStats,
     get_db_session
@@ -158,7 +160,7 @@ class SignalBroadcast(BaseModel):
     stop_loss: float
     take_profit: float
     leverage: float
-    risk_pct: Optional[float] = 0.02  # Risk % (0.02=2% aggressive, 0.03=3% conservative)
+    risk_pct: float  # Required risk fraction; signal_guard bounds it to (0, MAX_BROADCAST_RISK_PCT=0.03]
     timeframe: Optional[str] = None
     trend_strength: Optional[float] = None
     volatility: Optional[float] = None
@@ -278,6 +280,11 @@ async def broadcast_signal(
     Called by: Your algo when it opens a position
     Auth: Requires MASTER_API_KEY
     """
+    # Wave 1 (C46 / I11): validate BEFORE the try below (its except would turn a 422 into a 500) and before any DB write
+    err = signal_guard.validate_signal_payload(signal.action, signal.entry_price, signal.stop_loss,
+                                               signal.take_profit, signal.leverage, signal.risk_pct)
+    if err:
+        raise HTTPException(status_code=422, detail=err)
     try:
         # Generate signal ID
         signal_id = secrets.token_urlsafe(16)
