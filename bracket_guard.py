@@ -8,7 +8,8 @@ already parsed into Pos / Leg / Rec with the parsers at the bottom of this file.
 
 Spec: docs/superpowers/specs/2026-09-28-wave1-phase0-safety-design.md, change C01 (rev 3) and amendment A10
 (owner, 2026-09-28): on masters a leg whose level differs from the recorded one is alarmed (LEG_LEVEL_MOVED) and
-never cancelled, moved or replaced; a MISSING SL or TP is still re-placed (SL first). Followers keep replacing
+never cancelled, moved or replaced; a MISSING SL or TP is still re-placed (SL first). QC (Wave 1): owner stops on
+another trigger basis or split into parts also count as the SL on masters. Followers keep replacing
 service orders: they call decide(..., level_policy=LEVEL_REPLACE).
 """
 import dataclasses
@@ -117,10 +118,6 @@ def _pos(v):
 
 def beyond_sl(side, px, sl):
     return px <= sl if side > 0 else px >= sl
-
-
-def _loss_side(pos, px):
-    return pos.entry_px is None or (px < pos.entry_px if pos.side > 0 else px > pos.entry_px)
 
 
 def _profit_side(pos, px):
@@ -273,8 +270,12 @@ def decide(pos, rec, legs, ref, tick, lot, now, flat_confirmed=False, flat_since
     leftovers + CLEAR_RECORD; 4 levels from rec (else RECORD_SIDE_MISMATCH + untracked path); 5 valid SL;
     6 no SL -> CLOSE if price beyond on the SL's basis, else PLACE_SL then SL cancels; 7 TP (unknown level ->
     TP_LEVEL_UNKNOWN only; TP never closes); 8 other reduce-only legs -> FOREIGN_REDUCE_ONLY.
+    Untracked path (QC): exactly one exit-side SL leg with a trigger (any level, either SL kind) -> ADOPT it; more
+    than one, or only trigger-less ones -> AMBIGUOUS_SL_UNTRACKED; NAKED_UNKNOWN_LEVEL only with no SL leg at all.
     A10: with level_policy=LEVEL_ALARM an exit-side SL/TP leg away from the recorded level is never cancelled
-    (LEG_LEVEL_MOVED); one that would otherwise be valid counts as that leg being present."""
+    (LEG_LEVEL_MOVED), nor is a stop-market on another trigger basis (LEG_BASIS_CHANGED) or an exit-side leg of kind
+    OTHER (LEG_UNCLASSIFIED_KEPT). The exit-side stop-markets together (any level or basis, quantities summed) count
+    as the SL being present when they cover the position; the TP legs likewise. Stop-limits never count as the SL."""
     if level_policy not in LEVEL_POLICIES:
         raise ValueError('level_policy must be one of %s' % (LEVEL_POLICIES,))
     if pos is UNKNOWN or legs is UNKNOWN:
@@ -315,8 +316,10 @@ def decide(pos, rec, legs, ref, tick, lot, now, flat_confirmed=False, flat_since
     else:
         if rec is not None:
             acts.append(Action('ALARM', 'RECORD_SIDE_MISMATCH', 'critical'))
-        cand = [l for l in sl_c if l.kind == STOP_MARKET and l.trigger is not None and _loss_side(pos, l.trigger)]
-        if len(cand) > 1:
+        # QC correctness-core-1: I4(d) closes only an untracked position with NO SL leg. Any exit-side stop counts,
+        # at whatever level (a break-even or trailed stop sits at/through entry) and of either SL kind.
+        cand = [l for l in sl_c if l.trigger is not None]
+        if len(cand) > 1 or (not cand and sl_c):
             return acts + [Action('ALARM', 'AMBIGUOUS_SL_UNTRACKED', 'critical')]
         if not cand:
             if pos.opened_ts is not None and now - pos.opened_ts < ENTRY_GRACE_S:
@@ -340,12 +343,25 @@ def decide(pos, rec, legs, ref, tick, lot, now, flat_confirmed=False, flat_since
         lvl_ok = (trusted is not None and l.oid == trusted) if l.trigger is None else abs(l.trigger - sl_lvl) <= tol
         return lvl_ok and covers(l) and basis_ok(l)
 
+    def sum_covers(ls):
+        return bool(ls) and (any(l.close_position or l.qty is None for l in ls)
+                             or sum(l.qty for l in ls) >= pos.qty - lot / 2)
+
     ok_sl = [l for l in sl_c if sl_valid(l)]
     keep_sl = min(ok_sl, key=lambda l: (not l.position_level, l.oid != trusted, -(l.qty or 1e18))) if ok_sl else None
     moved_sl = [l for l in sl_c if keep_moved and l not in ok_sl
                 and l.level is not None and abs(l.level - sl_lvl) > tol]                          # A10
+    rebased_sl = [l for l in sl_c if keep_moved and l.kind == STOP_MARKET and l not in ok_sl and l not in moved_sl
+                  and l.trigger is not None and not basis_ok(l)]                                  # A10 (QC)
     acts += [_moved('SL', l, sl_lvl) for l in moved_sl]
-    sl_present = keep_sl is not None or any(l.kind == STOP_MARKET and covers(l) and basis_ok(l) for l in moved_sl)
+    acts += [Action('ALARM', 'LEG_BASIS_CHANGED', 'warning', level=l.level, leg=l,
+                    ctx={'leg': 'SL', 'recorded_basis': basis, 'live_basis': l.basis, 'live': l.level, 'oid': l.oid})
+             for l in rebased_sl]
+    # QC money-masters-1 (A10): on masters the owner's exit-side stop-markets protect together, at any level, on any
+    # basis and split into parts; the SL is missing only when they do not cover the position.
+    owner_sl = [l for l in sl_c if keep_moved and l.kind == STOP_MARKET and l.trigger is not None]
+    sl_by_owner = keep_sl is None and sum_covers(owner_sl)
+    sl_present = keep_sl is not None or sl_by_owner
     if not sl_present:
         px = (ref or {}).get(basis)
         if px is not None and beyond_sl(pos.side, px, sl_lvl):
@@ -356,10 +372,19 @@ def decide(pos, rec, legs, ref, tick, lot, now, flat_confirmed=False, flat_since
         acts.append(Action('ALARM', 'LEG_UNPARSEABLE', leg=keep_sl))
     if not (keep_sl is not None and keep_sl.position_level):
         acts += [Action('CANCEL', 'SL_EXTRA_OR_INVALID', leg=l) for l in sl_c
-                 if l is not keep_sl and not l.position_level and l not in moved_sl]
+                 if l is not keep_sl and not l.position_level and l not in moved_sl and l not in rebased_sl
+                 and not (sl_by_owner and l in owner_sl)]
+
+    def foreign(ls):
+        # QC correctness-core-5 (A10): masters keep an exit-side reduce-only leg they cannot classify (a trailing
+        # stop, say) and alarm; wrong-side reduce-only legs cannot protect the position and are still cancelled.
+        return [Action('ALARM', 'LEG_UNCLASSIFIED_KEPT', 'warning', level=l.level, leg=l,
+                       ctx={'oid': l.oid, 'live': l.level})
+                if keep_moved and l.side == xs else Action('CANCEL', 'FOREIGN_REDUCE_ONLY', leg=l) for l in ls]
+
     if tp_lvl is None:                                                                            # rev 3 (R3-L1)
         acts.append(Action('ALARM', 'TP_LEVEL_UNKNOWN'))
-        return acts + [Action('CANCEL', 'FOREIGN_REDUCE_ONLY', leg=l) for l in rest]
+        return acts + foreign(rest)
 
     def tp_qty_ok(l):
         return l.close_position or l.qty is None or abs(l.qty - pos.qty) <= lot / 2
@@ -370,12 +395,15 @@ def decide(pos, rec, legs, ref, tick, lot, now, flat_confirmed=False, flat_since
     moved_tp = [l for l in tp_c if keep_moved and l not in ok_tp
                 and l.level is not None and abs(l.level - tp_lvl) > tol]                          # A10
     acts += [_moved('TP', l, tp_lvl) for l in moved_tp]
+    owner_tp = [l for l in tp_c if keep_moved and l.level is not None]                            # A10 (QC)
+    tp_by_owner = keep_tp is None and (any(tp_qty_ok(l) for l in moved_tp) or sum_covers(owner_tp))
     if not (keep_tp is not None and keep_tp.position_level):
         acts += [Action('CANCEL', 'TP_EXTRA_OR_INVALID', leg=l) for l in tp_c
-                 if l is not keep_tp and not l.position_level and l not in moved_tp]
-    if keep_tp is None and not any(tp_qty_ok(l) for l in moved_tp):
+                 if l is not keep_tp and not l.position_level and l not in moved_tp
+                 and not (tp_by_owner and l in owner_tp)]
+    if keep_tp is None and not tp_by_owner:
         acts.append(Action('PLACE_TP', 'TP_REPAIRED', level=tp_lvl, qty=pos.qty, ctx={'tp_kind': tp_kind}))
-    return acts + [Action('CANCEL', 'FOREIGN_REDUCE_ONLY', leg=l) for l in rest]
+    return acts + foreign(rest)
 
 
 class ChurnGuard:

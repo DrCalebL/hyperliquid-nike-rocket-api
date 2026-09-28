@@ -3,7 +3,8 @@
 Byte-identical in massive-rocket-algos/tests, kraken-nike-rocket-api/tests and hyperliquid-nike-rocket-api/tests
 (stdlib unittest, so `python -m unittest` in the master and pytest in the followers both run it). Imports only
 bracket_guard. Covers: the pinned API, the venue parsers on captured shapes, every bg.decide() rule (rev 2 + rev 3),
-the A10 level policy (masters alarm-only, followers replace), ChurnGuard, and a 5,000-state x 3-pass property fuzz.
+the A10 level policy (masters alarm-only, followers replace), ChurnGuard, a 5,000-state x 3-pass property fuzz per
+policy with prices inside/at/through the SL, and an untracked/flat fuzz (QC coverage-masters-6).
 """
 import dataclasses
 import inspect
@@ -308,9 +309,13 @@ class TestDecidePosition(unittest.TestCase):
         self.both(P(), R(), [SL(qty=799.6), TP()], [])                           # within lot/2
         self.both(P(), R(), [SL(qty=None), TP()], [])                            # whole-position leg
 
-    def test_basis_mismatch_is_invalid(self):
-        self.both(P(), R(basis='mark'), [SL(basis='last'), TP()],
-                  ['PLACE_SL:SL_REPAIRED', 'CANCEL:SL_EXTRA_OR_INVALID'])
+    def test_basis_mismatch_is_invalid_on_followers_kept_on_masters(self):
+        self.assertEqual(kinds(plan(P(), R(basis='mark'), [SL(basis='last'), TP()], policy=bg.LEVEL_REPLACE)),
+                         ['PLACE_SL:SL_REPAIRED', 'CANCEL:SL_EXTRA_OR_INVALID'])
+        acts = plan(P(), R(basis='mark'), [SL(basis='last'), TP()])                 # A10: an owner basis edit
+        self.assertEqual(kinds(acts), ['ALARM:LEG_BASIS_CHANGED'])
+        self.assertEqual(acts[0].ctx, {'leg': 'SL', 'recorded_basis': 'mark', 'live_basis': 'last', 'live': 0.46,
+                                       'oid': 'sl1'})
         self.both(P(), R(basis='mark'), [SL(basis=None), TP()], [])
 
     def test_duplicate_valid_sls_cancel_exactly_one(self):
@@ -332,8 +337,12 @@ class TestDecidePosition(unittest.TestCase):
 
     def test_wrong_side_and_other_reduce_only_cancelled(self):
         self.both(P(), R(), [SL(), TP(), SL('w', side='buy', trigger=0.5)], ['CANCEL:FOREIGN_REDUCE_ONLY'])
-        self.both(P(), R(), [SL(), TP(), Leg('o', 'sell', bg.OTHER, 800.0, trigger=0.3, reduce_only=True)],
-                  ['CANCEL:FOREIGN_REDUCE_ONLY'])
+        other = Leg('o', 'sell', bg.OTHER, 800.0, trigger=0.3, reduce_only=True)
+        self.assertEqual(kinds(plan(P(), R(), [SL(), TP(), other], policy=bg.LEVEL_REPLACE)),
+                         ['CANCEL:FOREIGN_REDUCE_ONLY'])
+        acts = plan(P(), R(), [SL(), TP(), other])            # masters (A10): an exit-side unclassified leg is kept
+        self.assertEqual(kinds(acts), ['ALARM:LEG_UNCLASSIFIED_KEPT'])
+        self.assertEqual((acts[0].leg.oid, acts[0].ctx), ('o', {'oid': 'o', 'live': 0.3}))
 
     def test_non_reduce_only_orders_never_touched(self):
         self.both(P(), R(), [SL(), TP(), Leg('n', 'sell', bg.TP_LIMIT, 800.0, limit=0.52),
@@ -348,11 +357,37 @@ class TestDecidePosition(unittest.TestCase):
 
     def test_untracked_two_sls_ambiguous(self):
         self.both(P(), None, [SL('a'), SL('b', trigger=0.45), TP()], ['ALARM:AMBIGUOUS_SL_UNTRACKED'])
+        self.both(P(), None, [SL('a'), SL('b', trigger=0.475), TP()], ['ALARM:AMBIGUOUS_SL_UNTRACKED'])
+        self.both(P(opened=NOW - 500), None, [SL('a', trigger=None)], ['ALARM:AMBIGUOUS_SL_UNTRACKED'])
+
+    def test_untracked_stop_at_or_through_entry_is_adopted_never_closed(self):
+        # correctness-core-1: I4(d) closes an untracked position only when it has NO SL leg. A break-even or
+        # trailed stop (at/through entry) and a stop-limit are SL legs: adopt their trigger as the level.
+        for trig, kind in ((0.47, bg.STOP_MARKET), (0.475, bg.STOP_MARKET), (0.46, bg.STOP_LIMIT)):
+            for opened in (None, NOW - 500):
+                for policy in BOTH:
+                    with self.subTest(trig=trig, kind=kind, opened=opened, policy=policy):
+                        acts = plan(P(opened=opened), None, [SL(trigger=trig, kind=kind), TP()], policy=policy)
+                        self.assertEqual(kinds(acts)[0], 'ADOPT:UNTRACKED_POSITION_ADOPTED')
+                        self.assertEqual((acts[0].level, acts[0].ctx['sl_oid']), (trig, 'sl1'))
+                        self.assertFalse(any(a.kind == 'CLOSE' for a in acts))
+        short = plan(P(-1, opened=NOW - 500), None, [SL(side='buy', trigger=0.47)])
+        self.assertEqual(kinds(short)[0], 'ADOPT:UNTRACKED_POSITION_ADOPTED')
+        self.both(P(opened=NOW - 500), R(-1), [SL(trigger=0.47), TP()],
+                  ['ALARM:RECORD_SIDE_MISMATCH', 'ADOPT:UNTRACKED_POSITION_ADOPTED'])
 
     def test_untracked_naked_young_waits_old_closes(self):
         self.both(P(opened=NOW - 30), None, [TP()], ['ALARM:UNTRACKED_NAKED_YOUNG'])
         self.both(P(opened=NOW - 120), None, [TP()], ['CLOSE:NAKED_UNKNOWN_LEVEL'])
         self.both(P(opened=None), None, [], ['CLOSE:NAKED_UNKNOWN_LEVEL'])
+
+    def test_valid_sl_resting_with_price_through_its_level_never_closes(self):
+        # coverage-masters-6: a valid SL at the recorded level while price is at/through it (the stop is firing).
+        for ref in ({'last': 0.46}, {'last': 0.455}, {'last': 0.40, 'mark': 0.40}):
+            self.both(P(), R(), [SL(), TP()], [], ref=ref)
+        self.both(P(-1), R(-1), [SL(side='buy', trigger=0.48), TP(side='buy', limit=0.45)], [],
+                  ref={'last': 0.49})
+        self.both(P(), R(basis='mark'), [SL(basis='mark'), TP()], [], ref={'last': 0.40, 'mark': 0.40})
 
     def test_record_side_mismatch_alarms_then_untracked_path(self):
         self.both(P(), R(-1), [SL(), TP()], ['ALARM:RECORD_SIDE_MISMATCH', 'ADOPT:UNTRACKED_POSITION_ADOPTED'])
@@ -361,8 +396,10 @@ class TestDecidePosition(unittest.TestCase):
     def test_trusted_oid_validates_an_unparseable_leg(self):
         odd = Leg('sl9', 'sell', bg.OTHER, 800.0, reduce_only=True)
         self.both(P(), R(sl_oid='sl9', sl_oid_trusted=True), [odd, TP()], ['ALARM:LEG_UNPARSEABLE'])
-        self.both(P(), R(sl_oid='sl9', sl_oid_trusted=False), [odd, TP()],
-                  ['PLACE_SL:SL_REPAIRED', 'CANCEL:FOREIGN_REDUCE_ONLY'])
+        untrusted = R(sl_oid='sl9', sl_oid_trusted=False)
+        self.assertEqual(kinds(plan(P(), untrusted, [odd, TP()], policy=bg.LEVEL_REPLACE)),
+                         ['PLACE_SL:SL_REPAIRED', 'CANCEL:FOREIGN_REDUCE_ONLY'])
+        self.assertEqual(kinds(plan(P(), untrusted, [odd, TP()])), ['PLACE_SL:SL_REPAIRED', 'ALARM:LEG_UNCLASSIFIED_KEPT'])
 
     def test_phemex_position_level_legs_never_cancelled(self):
         legs = bg.legs_from_phemex_position({'info': {'stopLossRp': '0.46', 'takeProfitRp': '0.49'}}, 'sell')
@@ -548,6 +585,53 @@ class TestLevelPolicyA10(unittest.TestCase):
         self.assertEqual(kinds(plan(P(), R(), [SL(), TP(qty=400.0)])),
                          ['CANCEL:TP_EXTRA_OR_INVALID', 'PLACE_TP:TP_REPAIRED'])
 
+    def test_owner_moved_stop_on_another_basis_protects_masters(self):
+        # money-masters-1: the owner widens to 0.455 on MARK while the record says 0.46 on last; last is through 0.46.
+        legs = [SL('own', trigger=0.455, basis='mark'), TP()]
+        acts = plan(P(), R(), legs, ref={'last': 0.4595, 'mark': 0.4601})
+        self.assertEqual(kinds(acts), ['ALARM:LEG_LEVEL_MOVED'])
+        self.assertEqual(kinds(plan(P(), R(), legs, ref={'last': 0.47})), ['ALARM:LEG_LEVEL_MOVED'])
+        self.assertEqual(kinds(plan(P(), R(), legs, ref={'last': 0.4595}, policy=bg.LEVEL_REPLACE)),
+                         ['CLOSE:SL_MISSING_PRICE_BEYOND'])
+
+    def test_owner_basis_switch_at_the_recorded_level_is_kept(self):
+        legs = [SL('own', basis='mark'), TP()]
+        self.assertEqual(kinds(plan(P(), R(), legs)), ['ALARM:LEG_BASIS_CHANGED'])
+        self.assertEqual(kinds(plan(P(), R(), legs, ref={'last': 0.459})), ['ALARM:LEG_BASIS_CHANGED'])
+
+    def test_owner_split_stops_count_together(self):
+        split = [SL('a', trigger=0.455, qty=400.0), SL('b', trigger=0.45, qty=400.0), TP()]
+        acts = plan(P(), R(), split, ref={'last': 0.4595})
+        self.assertEqual(kinds(acts), ['ALARM:LEG_LEVEL_MOVED', 'ALARM:LEG_LEVEL_MOVED'])
+        self.assertEqual(kinds(plan(P(), R(), split)), ['ALARM:LEG_LEVEL_MOVED', 'ALARM:LEG_LEVEL_MOVED'])
+        at_level = [SL('a', qty=400.0), SL('b', trigger=0.45, qty=400.0, basis='mark'), TP()]
+        self.assertEqual(kinds(plan(P(), R(), at_level, ref={'last': 0.4595})), ['ALARM:LEG_LEVEL_MOVED'])
+        self.assertEqual(kinds(plan(P(), R(), split, policy=bg.LEVEL_REPLACE)),
+                         ['PLACE_SL:SL_REPAIRED', 'CANCEL:SL_EXTRA_OR_INVALID', 'CANCEL:SL_EXTRA_OR_INVALID'])
+        short = [SL('a', trigger=0.455, qty=300.0), SL('b', trigger=0.45, qty=300.0), TP()]   # 600 of 800
+        self.assertEqual(kinds(plan(P(), R(), short)),
+                         ['ALARM:LEG_LEVEL_MOVED', 'ALARM:LEG_LEVEL_MOVED', 'PLACE_SL:SL_REPAIRED'])
+        self.assertEqual(kinds(plan(P(), R(), short, ref={'last': 0.4595})),
+                         ['ALARM:LEG_LEVEL_MOVED', 'ALARM:LEG_LEVEL_MOVED', 'CLOSE:SL_MISSING_PRICE_BEYOND'])
+
+    def test_owner_split_tps_count_together(self):
+        legs = [SL(), TP('a', qty=400.0), TP('b', limit=0.5, qty=400.0)]
+        self.assertEqual(kinds(plan(P(), R(), legs)), ['ALARM:LEG_LEVEL_MOVED'])
+        self.assertEqual(kinds(plan(P(), R(), legs, policy=bg.LEVEL_REPLACE)),
+                         ['CANCEL:TP_EXTRA_OR_INVALID', 'CANCEL:TP_EXTRA_OR_INVALID', 'PLACE_TP:TP_REPAIRED'])
+
+    def test_owner_trailing_stop_is_kept_on_masters(self):
+        # correctness-core-5 / money-masters-6: Binance TRAILING_STOP_MARKET parses as OTHER.
+        row = {'algoId': 9001, 'algoType': 'CONDITIONAL', 'orderType': 'TRAILING_STOP_MARKET', 'side': 'SELL',
+               'quantity': '800', 'reduceOnly': True, 'workingType': 'CONTRACT_PRICE'}
+        trail = bg.leg_from_binance_algo(row)
+        self.assertEqual(trail.kind, bg.OTHER)
+        self.assertEqual(kinds(plan(P(), R(), [SL(), TP(), trail])), ['ALARM:LEG_UNCLASSIFIED_KEPT'])
+        self.assertEqual(kinds(plan(P(), R(tp=None), [SL(), trail])),
+                         ['ALARM:TP_LEVEL_UNKNOWN', 'ALARM:LEG_UNCLASSIFIED_KEPT'])
+        self.assertEqual(kinds(plan(P(), R(), [SL(), TP(), trail], policy=bg.LEVEL_REPLACE)),
+                         ['CANCEL:FOREIGN_REDUCE_ONLY'])
+
     def test_mis_levelled_trusted_stop(self):
         rec = R(sl_oid='s9', sl_oid_trusted=True)
         legs = [SL('s9', trigger=0.455), TP()]
@@ -570,22 +654,39 @@ class TestLevelPolicyA10(unittest.TestCase):
 def _truth_valid(l, p, r, xs):
     return (l.kind == bg.STOP_MARKET and l.side == xs and (l.reduce_only or l.close_position) and l.trigger is not None
             and abs(l.trigger - r.sl) <= TICK * bg.TICK_TOL and (l.qty is None or l.qty >= p.qty - LOT / 2)
-            and (l.basis is None or l.basis == r.sl_basis))
+            and (l.basis is None or r.sl_basis is None or l.basis == r.sl_basis))
 
 
-def _truth_protects(l, p, r, xs, policy):
-    if _truth_valid(l, p, r, xs):
+def _truth_covered(legs, p, r, xs, policy):
+    """Ground truth for 'the SL is present'. Followers: one valid stop-market at the recorded level. Masters (A10):
+    also the exit-side stop-markets together, at any level and on any basis, when their quantities cover."""
+    legs = list(legs)
+    if any(_truth_valid(l, p, r, xs) for l in legs):
         return True
-    return (policy == bg.LEVEL_ALARM and l.kind == bg.STOP_MARKET and l.side == xs and l.reduce_only
-            and l.trigger is not None and (l.qty is None or l.qty >= p.qty - LOT / 2)
-            and (l.basis is None or l.basis == r.sl_basis))
+    if policy != bg.LEVEL_ALARM:
+        return False
+    own = [l for l in legs if l.kind == bg.STOP_MARKET and l.side == xs and (l.reduce_only or l.close_position)
+           and l.trigger is not None]
+    return bool(own) and (any(l.qty is None or l.close_position for l in own)
+                          or sum(l.qty for l in own) >= p.qty - LOT / 2)
+
+
+def _rand_ref(rng, side, sl_lvl):
+    """Reference prices per basis: inside the SL, at it, or through it, each basis drawn on its own; a basis may be
+    missing from the read."""
+    through = sl_lvl - 0.002 if side > 0 else sl_lvl + 0.002
+    ref = {b: rng.choice((0.47, 0.47, sl_lvl, through)) for b in ('last', 'mark')}
+    if rng.random() < 0.1:
+        del ref[rng.choice(('last', 'mark'))]
+    return ref
 
 
 class TestPropertyFuzz(unittest.TestCase):
     """5,000 random states x 3 passes per level policy, with random external cancels, TP rejections, SL placement
-    failures and misparsed side/kind/level of the guardian's own stop. Executor contract as the ports: PLACE_SL
-    success is noted and merged into the record, a failed PLACE_SL closes, cancels of the protected stop need a
-    successful PLACE_SL earlier in the same plan."""
+    failures and misparsed side/kind/level of the guardian's own stop, random trigger bases and a reference price
+    per pass inside, at or through the SL (QC coverage-masters-6). Executor contract as the ports: PLACE_SL success
+    is noted and merged into the record, a failed PLACE_SL closes, cancels of the protected stop need a successful
+    PLACE_SL earlier in the same plan. Minimum sample counts keep the close properties from going vacuous."""
     STATES = 5000
 
     def test_fuzz_alarm_policy(self):
@@ -599,6 +700,7 @@ class TestPropertyFuzz(unittest.TestCase):
         pool = [bg.STOP_MARKET, bg.STOP_LIMIT, bg.TP_LIMIT, bg.TP_TRIGGER_MARKET, bg.OTHER]
         tol = TICK * bg.TICK_TOL
         converged = 0
+        seen = {'covered_through': 0, 'close_beyond': 0, 'place_sl': 0}
         for n in range(self.STATES):
             faulty = rng.random() < 0.5
             side = rng.choice((1, -1))
@@ -607,18 +709,22 @@ class TestPropertyFuzz(unittest.TestCase):
             sl_lvl, tp_def = (0.46, 0.49) if side > 0 else (0.48, 0.45)
             tp_lvl = rng.choice((tp_def, None))
             trusted = rng.random() < 0.7
-            r = Rec(side, sl_lvl, tp_lvl, 'last', bg.TP_LIMIT, sl_oid='own-sl', sl_oid_trusted=trusted)
+            basis = rng.choice(('last', 'mark'))
+            r = Rec(side, sl_lvl, tp_lvl, basis, bg.TP_LIMIT, sl_oid='own-sl', sl_oid_trusted=trusted)
             p = Pos(side, qty, 0.47, None)
             book = {}
             if rng.random() < 0.7:
                 lvl = rng.choice((sl_lvl, sl_lvl, sl_lvl + 0.003, sl_lvl - 0.003)) if faulty else sl_lvl
-                book['own-sl'] = Leg('own-sl', xs, bg.STOP_MARKET, qty, trigger=lvl, reduce_only=True)
+                own_basis = rng.choice((basis, basis, None, 'last', 'mark')) if faulty else basis
+                book['own-sl'] = Leg('own-sl', xs, bg.STOP_MARKET, qty, trigger=lvl, reduce_only=True,
+                                     basis=own_basis)
             for j in range(rng.randint(0, 3)):
                 k = rng.choice(pool)
                 lvl = rng.choice((sl_lvl, tp_def, 0.5, 0.44))
                 trig, lim = (None, lvl) if k == bg.TP_LIMIT else (lvl, None)
                 book['x%d' % j] = Leg('x%d' % j, rng.choice((xs, other)), k, rng.choice((qty, qty / 2, None)),
-                                      trigger=trig, limit=lim, reduce_only=rng.random() < 0.8)
+                                      trigger=trig, limit=lim, reduce_only=rng.random() < 0.8,
+                                      basis=rng.choice((None, 'last', 'mark')))
             cg = bg.ChurnGuard()
             if 'own-sl' in book and rng.random() < 0.5 and (faulty or trusted):   # fault-free: history implies trust
                 cg.note_placed('SL', 'own-sl', NOW - 60)
@@ -638,18 +744,30 @@ class TestPropertyFuzz(unittest.TestCase):
                     elif c.oid == own and mis == 'trigger' and c.trigger is not None:
                         c.trigger = c.trigger + 0.002
                     legs.append(c)
-                protects_before = [l.oid for l in book.values() if _truth_protects(l, p, r, xs, policy)]
-                raw = bg.decide(p, r, legs, {'last': 0.47}, TICK, LOT, now, level_policy=policy)
+                ref = _rand_ref(rng, side, sl_lvl)
+                covered_before = _truth_covered(book.values(), p, r, xs, policy)
+                covered_seen = _truth_covered(legs, p, r, xs, policy)       # what decide() can see (misparses)
+                raw = bg.decide(p, r, legs, ref, TICK, LOT, now, level_policy=policy)
                 acts, _ = cg.filter(raw, legs, now, qty=p.qty, rec=r)
-                ctx = 'state %d pass %d policy %s raw %s filtered %s' % (n, pas, policy, kinds(raw), kinds(acts))
+                ctx = 'state %d pass %d policy %s ref %s raw %s filtered %s' % (n, pas, policy, ref, kinds(raw),
+                                                                                kinds(acts))
                 last_own = cg.placed['SL'][-1][1] if cg.placed['SL'] else None
                 protected = {o for o in (last_own, bg.trusted_sl_oid(r)) if o}
                 for i, a in enumerate(acts):
                     if a.kind == 'CANCEL' and a.leg.oid in protected and a.code != 'ORPHAN_LEG':
                         self.assertTrue(any(b.kind == 'PLACE_SL' for b in acts[:i]), 'protected stop cancelled: ' + ctx)
-                if protects_before:
+                px = ref.get(basis)
+                through = px is not None and bg.beyond_sl(side, px, sl_lvl)
+                if covered_seen:
                     self.assertFalse(any(a.kind == 'CLOSE' and a.code != 'SL_UNMAINTAINABLE' for a in acts),
                                      'close while a valid SL exists: ' + ctx)
+                    seen['covered_through'] += through
+                elif mis is None:
+                    # nothing covers the position: decide() must close when price is through the recorded SL on
+                    # its own basis, else re-place the SL (I4(a)); never both, never neither
+                    self.assertEqual([a.code for a in raw if a.kind in ('CLOSE', 'PLACE_SL')],
+                                     ['SL_MISSING_PRICE_BEYOND' if through else 'SL_REPAIRED'], 'I4(a): ' + ctx)
+                    seen['close_beyond' if through else 'place_sl'] += 1
                 if (any(a.kind == 'PLACE_SL' for a in raw) and not any(a.kind in ('PLACE_SL', 'CLOSE') for a in acts)):
                     self.assertTrue(cg.placed['SL'] and cg.placed['SL'][-1][1] in {l.oid for l in legs},
                                     'PLACE_SL suppressed without the own stop on the book: ' + ctx)
@@ -658,9 +776,13 @@ class TestPropertyFuzz(unittest.TestCase):
                         t = book.get(a.leg.oid) if a.kind == 'CANCEL' and a.leg is not None else None
                         if t is not None and t.side == xs and t.level is not None and t.kind in bg.SL_KINDS:
                             self.assertLessEqual(abs(t.level - sl_lvl), tol, 'A10: moved SL cancelled: ' + ctx)
+                            self.assertFalse(t.kind == bg.STOP_MARKET and t.basis not in (None, basis),
+                                             'A10: rebased SL cancelled: ' + ctx)
                         if (t is not None and t.side == xs and t.level is not None and t.kind in bg.TP_KINDS
                                 and tp_lvl is not None):
                             self.assertLessEqual(abs(t.level - tp_lvl), tol, 'A10: moved TP cancelled: ' + ctx)
+                        self.assertFalse(t is not None and t.side == xs and t.kind == bg.OTHER,
+                                         'A10: exit-side unclassified leg cancelled: ' + ctx)
                 placed_ok = False
                 for a in acts:
                     if a.kind == 'CLOSE':
@@ -691,22 +813,104 @@ class TestPropertyFuzz(unittest.TestCase):
                             r.tp_oid = oid
                 if p is None:
                     break
-                if protects_before:
-                    self.assertTrue(any(_truth_protects(l, p, r, xs, policy) for l in book.values()),
+                if covered_before:
+                    self.assertTrue(_truth_covered(book.values(), p, r, xs, policy),
                                     'plan removed the last protecting SL: ' + ctx)
                 now += 300
             if faulty or p is None:
                 continue
-            final = bg.decide(p, r, list(book.values()), {'last': 0.47}, TICK, LOT, now, level_policy=policy)
+            final = bg.decide(p, r, list(book.values()), {'last': 0.47, 'mark': 0.47}, TICK, LOT, now,
+                              level_policy=policy)
             acts, _ = cg.filter(final, list(book.values()), now, qty=p.qty, rec=r)
             ctx = 'state %d policy %s final %s' % (n, policy, kinds(acts))
             self.assertFalse([a for a in acts if a.kind in ('PLACE_SL', 'PLACE_TP', 'CANCEL', 'CLOSE')],
                              'no fixed point: ' + ctx)
-            self.assertTrue(any(_truth_protects(l, p, r, xs, policy) for l in book.values()), 'unprotected: ' + ctx)
+            self.assertTrue(_truth_covered(book.values(), p, r, xs, policy), 'unprotected: ' + ctx)
             if policy == bg.LEVEL_REPLACE:
                 ro = [l for l in book.values() if l.reduce_only and l.side == xs]
                 self.assertEqual(len([l for l in ro if l.kind in bg.SL_KINDS]), 1, 'not exactly one SL: ' + ctx)
                 if tp_lvl is not None:
                     self.assertEqual(len([l for l in ro if l.kind in bg.TP_KINDS]), 1, 'not exactly one TP: ' + ctx)
             converged += 1
-        self.assertGreater(converged, self.STATES // 4)
+        self.assertGreater(converged, self.STATES // 5)
+        for k, v in seen.items():                                   # vacuity guard: each branch really exercised
+            self.assertGreater(v, 200, 'fuzz never reached %s: %s' % (k, seen))
+
+    def test_fuzz_untracked_and_flat(self):
+        """Untracked positions (no record, or a record on the other side) and flat reads, both policies, one pass
+        each. I4(d): CLOSE NAKED_UNKNOWN_LEVEL iff no exit-side SL leg rests and the position is not young; exactly one
+        exit-side SL leg with a trigger is adopted at its trigger. Flat: nothing but CONFIRM_FLAT until confirmed, and
+        a resting recorded SL is never cancelled inside FLAT_PERSIST_S."""
+        rng = random.Random(23)
+        seen = {'naked_close': 0, 'adopt': 0, 'ambiguous': 0, 'young': 0, 'flat_wait': 0, 'flat_cleanup': 0,
+                'confirm': 0}
+        kinds_pool = [bg.STOP_MARKET, bg.STOP_LIMIT, bg.TP_LIMIT, bg.TP_TRIGGER_MARKET, bg.OTHER]
+        for n in range(4000):
+            policy = rng.choice(BOTH)
+            side = rng.choice((1, -1))
+            xs, other = ('sell', 'buy') if side > 0 else ('buy', 'sell')
+            sl_lvl = 0.46 if side > 0 else 0.48
+            legs = []
+            for j in range(rng.choice((0, 0, 1, 1, 2, 3))):
+                k = rng.choice(kinds_pool)
+                lvl = rng.choice((0.44, 0.46, 0.47, 0.475, 0.48, 0.49, 0.5))
+                trig = None if k == bg.TP_LIMIT or rng.random() < 0.05 else lvl
+                legs.append(Leg('x%d' % j, rng.choice((xs, other)), k, rng.choice((800.0, 400.0, None)), trigger=trig,
+                                limit=lvl if k in (bg.TP_LIMIT, bg.STOP_LIMIT) else None,
+                                reduce_only=rng.random() < 0.85, basis=rng.choice((None, 'last', 'mark'))))
+            ref = _rand_ref(rng, side, sl_lvl)
+            if rng.random() < 0.6:                                              # untracked position
+                p = Pos(side, 800.0, 0.47, rng.choice((None, NOW - 30, NOW - 500)))
+                rec = rng.choice((None, None, R(-side)))
+                acts = plan(p, rec, legs, ref=ref, policy=policy)
+                ctx = 'state %d policy %s legs %s plan %s' % (n, policy, legs, kinds(acts))
+                sl_legs = [l for l in legs if l.side == xs and l.kind in bg.SL_KINDS and (l.reduce_only or l.close_position)]
+                closes = [a for a in acts if a.kind == 'CLOSE']
+                young = p.opened_ts is not None and NOW - p.opened_ts < bg.ENTRY_GRACE_S
+                if sl_legs:
+                    self.assertNotIn('NAKED_UNKNOWN_LEVEL', [a.code for a in closes], 'I4(d) with an SL leg: ' + ctx)
+                    if any(l.kind == bg.STOP_MARKET and l.trigger is not None and (l.qty is None or l.qty >= 800.0)
+                           for l in sl_legs):
+                        self.assertEqual(closes, [], 'untracked close while a covering stop rests: ' + ctx)
+                    armed = [l for l in sl_legs if l.trigger is not None]
+                    if len(armed) == 1:
+                        adopt = [a for a in acts if a.kind == 'ADOPT']
+                        self.assertEqual([(a.level, a.ctx['sl_oid']) for a in adopt], [(armed[0].trigger, armed[0].oid)],
+                                         ctx)
+                        seen['adopt'] += 1
+                    else:
+                        self.assertEqual(kinds(acts)[-1], 'ALARM:AMBIGUOUS_SL_UNTRACKED', ctx)
+                        seen['ambiguous'] += 1
+                elif young:
+                    self.assertEqual(kinds(acts)[-1], 'ALARM:UNTRACKED_NAKED_YOUNG', ctx)
+                    seen['young'] += 1
+                else:
+                    self.assertEqual(kinds(closes), ['CLOSE:NAKED_UNKNOWN_LEVEL'], ctx)
+                    seen['naked_close'] += 1
+                continue
+            rec = rng.choice((None, R(side), R(side, sl_oid='x0', sl_oid_trusted=True),
+                              R(side, status='pending', created_ts=NOW - rng.choice((30, 200)))))
+            confirmed = rng.random() < 0.7
+            since = rng.choice((None, NOW - 10, NOW - 239, NOW - 240, NOW - 900))
+            acts = plan(None, rec, legs, ref=ref, policy=policy, flat_confirmed=confirmed, flat_since=since)
+            ctx = 'flat state %d policy %s rec %s legs %s plan %s' % (n, policy, rec, legs, kinds(acts))
+            self.assertFalse(any(a.kind in ('CLOSE', 'PLACE_SL', 'PLACE_TP', 'ADOPT') for a in acts), ctx)
+            prot = [l for l in legs if l.reduce_only or l.close_position or l.position_level]
+            if not prot and rec is None:
+                self.assertEqual(acts, [], ctx)
+                continue
+            if not confirmed:
+                self.assertEqual(kinds(acts), ['CONFIRM_FLAT'], ctx)
+                seen['confirm'] += 1
+                continue
+            resting = rec is not None and rec.status != 'pending' and any(
+                (l.oid == bg.trusted_sl_oid(rec)) or (l.kind in bg.SL_KINDS and l.level is not None
+                                                     and abs(l.level - rec.sl) <= TICK * bg.TICK_TOL) for l in prot)
+            if resting and (since is None or NOW - since < bg.FLAT_PERSIST_S):
+                self.assertFalse(any(a.kind == 'CANCEL' for a in acts), 'recorded SL cancelled early: ' + ctx)
+                seen['flat_wait'] += 1
+            elif any(a.kind == 'CANCEL' for a in acts):
+                self.assertTrue(all(a.code == 'ORPHAN_LEG' for a in acts if a.kind == 'CANCEL'), ctx)
+                seen['flat_cleanup'] += 1
+        for k, v in seen.items():
+            self.assertGreater(v, 50, 'fuzz never reached %s: %s' % (k, seen))
