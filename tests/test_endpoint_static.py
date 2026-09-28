@@ -47,3 +47,67 @@ def test_sec2_master_key_has_no_default_and_is_compared_in_constant_time():
     fn = _func(tree, 'verify_master_key')
     assert 'hmac.compare_digest' in {ast.unparse(c.func) for c in ast.walk(fn) if isinstance(c, ast.Call)}
     assert 'status_code=503' in ast.unparse(fn) and 'status_code=401' in ast.unparse(fn)
+
+
+# ---------------------------------------------------------------- SEC-3 (QC security-2): the admin password
+def _main_tree():
+    with open(os.path.join(ROOT, 'main.py'), encoding='utf-8') as f:
+        return ast.parse(f.read())
+
+
+def test_sec3_admin_password_has_no_committed_default():
+    with open(os.path.join(ROOT, 'admin_dashboard.py'), encoding='utf-8') as f:
+        tree = ast.parse(f.read())
+    assign = next(n for n in tree.body if isinstance(n, ast.Assign)
+                  and any(getattr(t, 'id', None) == 'ADMIN_PASSWORD' for t in n.targets))
+    assert ast.unparse(assign.value) == "os.getenv('ADMIN_PASSWORD')"
+    for path in ('main.py', 'admin_dashboard.py'):
+        with open(os.path.join(ROOT, path), encoding='utf-8') as f:
+            assert 'changeme' not in f.read()
+
+
+def test_sec3_every_admin_check_goes_through_the_constant_time_helper():
+    tree = _main_tree()
+    compares = [ast.unparse(n) for n in ast.walk(tree) if isinstance(n, ast.Compare)
+                and 'ADMIN_PASSWORD' in ast.unparse(n)]
+    assert compares == []                                                   # no plain == / != on the password
+    fn = _func(tree, 'admin_password_ok')
+    assert 'hmac.compare_digest' in {ast.unparse(c.func) for c in ast.walk(fn) if isinstance(c, ast.Call)}
+    assert 'status_code=503' in ast.unparse(fn)
+    uses = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and ast.unparse(n.func) == 'admin_password_ok']
+    assert len(uses) >= 20
+
+
+def test_sec3_admin_password_ok_behaviour():
+    tree = _main_tree()
+    fn = _func(tree, 'admin_password_ok')
+    import hmac
+
+    class HTTPException(Exception):
+        def __init__(self, status_code, detail=None):
+            self.status_code = status_code
+
+    def load(password):
+        ns = {'hmac': hmac, 'HTTPException': HTTPException, 'ADMIN_PASSWORD': password}
+        exec(compile(ast.Module(body=[fn], type_ignores=[]), 'main.py', 'exec'), ns)
+        return ns['admin_password_ok']
+    for unset in (None, ''):
+        try:
+            load(unset)('anything')
+            raise AssertionError('an unset ADMIN_PASSWORD must answer 503')
+        except HTTPException as e:
+            assert e.status_code == 503
+    ok = load('s3cret-value')
+    assert ok('s3cret-value') is True
+    assert ok('s3cret-valuX') is False and ok('') is False and ok(None) is False
+
+
+def test_sec3_the_admin_password_is_never_printed_or_advertised():
+    with open(os.path.join(ROOT, 'main.py'), encoding='utf-8') as f:
+        src = f.read()
+    tree = ast.parse(src)
+    prints = [ast.unparse(n) for n in ast.walk(tree) if isinstance(n, ast.Call) and ast.unparse(n.func) == 'print'
+              and ('ADMIN_PASSWORD' in ast.unparse(n) or 'x_admin_key' in ast.unparse(n))]
+    assert prints == []
+    root = _func(tree, 'root')
+    assert 'reset-database' not in ast.unparse(root) and 'password=' not in ast.unparse(root)

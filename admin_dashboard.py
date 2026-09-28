@@ -14,7 +14,7 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 
 DATABASE_URL = os.getenv("DATABASE_URL")
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "changeme123")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")      # SEC-3: no committed default; unset -> admin 503
 
 
 def get_db_connection():
