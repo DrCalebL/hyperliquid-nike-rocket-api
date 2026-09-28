@@ -53,6 +53,9 @@ from hosted_trading_loop import start_hosted_trading
 # Import position monitor to track P&L when trades close
 from position_monitor import start_position_monitor
 
+# Import position guardian (Wave 1): needs_recovery lane + bracket invariant for customer positions
+from position_guardian import start_position_guardian
+
 # Import tax reports for income tracking
 from tax_reports import (
     get_monthly_income,
@@ -5461,6 +5464,13 @@ async def startup_event():
             # ═══════════════════════════════════════════════════════════
             asyncio.create_task(start_expiry_checker(db_pool))
             print("🔑 API expiry checker scheduled (checks every 6 hours)")
+
+            # ═══════════════════════════════════════════════════════════
+            # POSITION GUARDIAN (Wave 1): recovery lane every 30 s in every
+            # GUARDIAN_MODE (off|shadow|enforce); full pass every 240 s
+            # ═══════════════════════════════════════════════════════════
+            asyncio.create_task(start_position_guardian(db_pool))
+            print("🛡️ Position guardian scheduled (starts in 45 seconds)")
             
         except Exception as e:
             print(f"⚠️ Background tasks failed to start: {e}")

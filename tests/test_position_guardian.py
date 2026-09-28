@@ -501,3 +501,16 @@ async def test_a_failed_recovery_close_alarms_and_is_retried_next_tick(g, db, ve
     g.world.advance(pg.LANE_S)
     await g._recovery_lane('shadow')
     assert db.positions[row['id']]['status'] == 'closed'
+
+
+def test_main_registers_the_guardian_right_after_the_expiry_checker():
+    with open(os.path.join(ROOT, 'main.py'), encoding='utf-8') as f:
+        tree = ast.parse(f.read())
+    assert any(isinstance(n, ast.ImportFrom) and n.module == 'position_guardian'
+               and [a.name for a in n.names] == ['start_position_guardian'] for n in tree.body)
+    startup = next(n for n in tree.body if isinstance(n, ast.AsyncFunctionDef) and n.name == 'startup_event')
+    calls = sorted((c for c in ast.walk(startup) if isinstance(c, ast.Call)
+                    and ast.unparse(c.func) == 'asyncio.create_task' and isinstance(c.args[0], ast.Call)),
+                   key=lambda c: c.lineno)
+    started = [ast.unparse(c.args[0]) for c in calls]
+    assert started.index('start_position_guardian(db_pool)') == started.index('start_expiry_checker(db_pool)') + 1
