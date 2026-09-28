@@ -1,2 +1,4 @@
 __pycache__/
 *.pyc
+gate_logs/
+chaos_out/
