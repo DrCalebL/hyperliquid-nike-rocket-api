@@ -234,7 +234,8 @@ async def place_entry_order_with_retry(
                 else:
                     # Unknown status but OK - treat as success (execute_trade confirms the fill)
                     logger.warning(f"⚠️ Entry returned ok but unexpected statuses: {statuses}")
-                    await _notify_unexpected_status("Entry", coin, statuses, user_email, user_api_key)
+                    # CA-B8-5: in the background - a slow e-mail must never lengthen the no-SL window
+                    _spawn_background(_notify_unexpected_status("Entry", coin, statuses, user_email, user_api_key))
                     return {"id": "unknown", "raw": result}
             else:
                 raise HLOrderRejected(f"HL order failed: status={status}, response={response}")
@@ -547,6 +548,23 @@ async def _notify_unexpected_status(kind: str, coin: str, statuses, user_email: 
         },
         level="warning"
     )
+
+
+_BACKGROUND_TASKS = set()   # strong references: the event loop keeps only weak ones to running tasks
+
+
+def _spawn_background(coro):
+    """CA-B8-5: run a notification coroutine without awaiting it (fire-and-forget); a failure is only logged."""
+    task = asyncio.create_task(coro)
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_background_done)
+    return task
+
+
+def _background_done(task):
+    _BACKGROUND_TASKS.discard(task)
+    if not task.cancelled() and task.exception() is not None:
+        logger.error(f"❌ Background notification failed: {task.exception()!r}")
 
 
 # ==================== CRITICAL FAILURE NOTIFICATIONS ====================

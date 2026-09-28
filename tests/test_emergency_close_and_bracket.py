@@ -335,3 +335,27 @@ def test_execute_trade_has_no_blind_sleep_2():
         for node in ast.walk(fn):
             if isinstance(node, ast.Call) and ast.unparse(node.func) == 'asyncio.sleep':
                 assert not (node.args and isinstance(node.args[0], ast.Constant) and node.args[0].value == 2)
+
+
+# ---------------------------------------------------------------- coordinator amendments (CA-B8-*)
+async def test_ca_b8_5_the_entry_unexpected_status_email_never_delays_the_entry(venue, monkeypatch):
+    """CA-B8-5: the entry's HL_UNEXPECTED_STATUS notification runs in the background, so a slow e-mail never
+    lengthens the no-SL window between the IOC and the SL."""
+    release, sent = asyncio.Event(), []
+
+    async def slow_notify(title, details, level='warning'):
+        await release.wait()                                                   # an e-mail that hangs
+        sent.append(title)
+        return True
+    monkeypatch.setattr(order_utils, 'notify_admin', slow_notify)
+    venue.script('order', lambda *a: fake_hl.ok_status('waitingForFill'))
+    ex = fake_hl.Exchange(fake_hl.Account.from_key('k'), account_address=WALLET)
+    res = await asyncio.wait_for(order_utils.place_entry_order_with_retry(ex, 'ADA', True, 100.0, 0.5), 2.0)
+    assert res == {'id': 'unknown', 'raw': fake_hl.ok_status('waitingForFill')}
+    assert sent == []                                                          # returned before the e-mail ended
+    release.set()
+    for _ in range(20):
+        if sent:
+            break
+        await asyncio.sleep(0)
+    assert sent and sent[0].startswith('HL_UNEXPECTED_STATUS: Entry')
