@@ -490,9 +490,9 @@ class HostedTradingLoop:
         - position_size = risk_amount / risk_per_unit
         - DO NOT multiply by leverage!
 
-        Wave 1 bracket flow: in-flight token -> acknowledge -> dedup (fail closed) -> IOC entry (never re-sent
-        while a position may exist) -> fill confirmation (totalSz, else user_state polls; no blind sleep) ->
-        SL (stop-market) FIRST -> TP -> INSERT 'open' sized to the confirmed fill. Every exit reached after the
+        Wave 1 bracket flow: in-flight token -> acknowledge -> dedup (fail closed) -> IOC entry (a raised IOC is
+        never re-sent) -> fill confirmation (totalSz, else user_state polls; no blind sleep) ->
+        SL (stop-market) FIRST -> TP -> live-size cross-check -> INSERT 'open'. Every exit reached after the
         entry may have filled ends with an SL + an 'open' row, a verified-flat account with no service orders,
         or a needs_recovery row for the guardian's recovery lane (I19).
         """
@@ -631,7 +631,7 @@ class HostedTradingLoop:
                 exchange=exchange, coin=coin, is_buy=is_buy,
                 quantity=quantity, limit_price=entry_limit_price,
                 user_email=user_email, user_api_key=user_api_key,
-                confirm_position_fn=functools.partial(self._position_may_exist, info, wallet_address, coin)
+                resend_after_exception=False     # QC money-followers-2: a raised IOC is never re-sent
             )
 
             if not entry_order:
@@ -739,6 +739,24 @@ class HostedTradingLoop:
                 stage = 'done'
                 return False
 
+            # ==================== SIZE CROSS-CHECK (QC money-followers-2) ====================
+            row_qty = bracket_qty
+            live_qty = await self._live_size_above_bracket(info, wallet_address, coin, is_buy, bracket_qty)
+            if live_qty is not None:
+                row_qty = live_qty
+                self.logger.critical(f"   🚨 ENTRY_SIZE_MISMATCH: live {coin} size {live_qty} > bracket {bracket_qty}")
+                await log_error_to_db(self.db_pool, user_api_key, "ENTRY_SIZE_MISMATCH",
+                    f"Live {coin} size {live_qty} exceeds the bracket size {bracket_qty}; row recorded at {live_qty}",
+                    {"coin": coin, "bracket_qty": bracket_qty, "live_qty": live_qty, "sl_order_id": sl_oid})
+                await notify_admin(
+                    title="ENTRY_SIZE_MISMATCH (HL)",
+                    details={"User": user_email, "Coin": coin, "Bracket Size": bracket_qty, "Live Size": live_qty,
+                             "SL Order": sl_oid,
+                             "Handling": "Row recorded at the live size. The SL/TP cover only the bracket size: "
+                                         "GUARDIAN_MODE=enforce re-sizes the SL on its next pass; in shadow/off "
+                                         "place a full-size SL on Hyperliquid now"},
+                    level="error")
+
             # ==================== RECORD OPEN POSITION ====================
             try:
                 async with self.db_pool.acquire() as conn:
@@ -763,7 +781,7 @@ class HostedTradingLoop:
                         signal['symbol'],   # BTC/USDT format
                         coin,               # BTC (HL format)
                         action.upper(),     # BUY or SELL
-                        bracket_qty,
+                        row_qty,
                         leverage,
                         entry_fill_price,
                         tp_price,
@@ -802,15 +820,21 @@ class HostedTradingLoop:
                 await self._post_entry_exception(user, signal, post, e)
             return False
 
-    async def _position_may_exist(self, info, wallet_address: str, coin: str) -> bool:
-        """confirm_position_fn for the IOC entry: True when a `coin` position exists OR the read failed."""
+    async def _live_size_above_bracket(self, info, wallet_address: str, coin: str, is_buy: bool,
+                                       bracket_qty: float) -> Optional[float]:
+        """QC money-followers-2: one user_state read once the bracket rests. The live |szi| when it exceeds
+        bracket_qty by more than half a lot (the row must then carry the live size, or select_row calls it
+        ROW_AMBIGUOUS and the guardian never repairs it); None otherwise or on a failed read."""
         try:
             hl_rate.charge(hl_rate.W_USER_STATE, 'trading')
             state = await asyncio.to_thread(info.user_state, wallet_address)
-            return coin_szi(state, coin) != 0
+            szi = coin_szi(state, coin)
         except Exception as e:
-            self.logger.warning(f"   ⚠️ Position check after an entry exception failed: {e} (assuming a position)")
-            return True
+            self.logger.warning(f"   ⚠️ Post-bracket size check read failed: {e}")
+            return None
+        live = abs(szi) if ((szi > 0) if is_buy else (szi < 0)) else 0.0
+        lot = 10 ** -int(self.asset_meta.get(coin, {}).get('szDecimals', 2))
+        return live if live > bracket_qty + lot / 2 else None
 
     async def _confirm_entry_fill(self, info, wallet_address: str, coin: str, is_buy: bool, entry_order: Dict):
         """

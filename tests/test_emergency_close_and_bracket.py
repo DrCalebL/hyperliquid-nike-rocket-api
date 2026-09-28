@@ -15,6 +15,7 @@ from tests.fakes import fake_hl
 from tests.fakes.fake_hl import creds, fast_sleep, notes, venue  # noqa: F401  (pytest fixtures)
 from tests.fakes.fake_pool import FakeDB, FakePool
 
+import bracket_guard
 import follower_guard
 import hl_rate
 import hosted_trading_loop as htl
@@ -335,6 +336,66 @@ def test_execute_trade_has_no_blind_sleep_2():
         for node in ast.walk(fn):
             if isinstance(node, ast.Call) and ast.unparse(node.func) == 'asyncio.sleep':
                 assert not (node.args and isinstance(node.args[0], ast.Constant) and node.args[0].value == 2)
+
+
+# ---------------------------------------------------------------- QC Wave 1: double entry (money-followers-2)
+def _flat_state():
+    return {'assetPositions': [], 'marginSummary': {'accountValue': '10000.0'}}
+
+
+async def test_qc_mf2_lagging_read_after_a_lost_ioc_response_never_resends_the_entry(venue, db, creds, notes, fast_sleep):
+    """QC money-followers-2: the IOC filled but its response was lost (502 / dropped connection) and the next
+    user_state read lags a block (flat). The entry is never re-sent: execute_trade confirms the fill from user_state
+    and brackets the single position."""
+    sent = []
+
+    def fill_then_502(account, coin, is_buy, sz, px, otype, ro):
+        if 'limit' in otype and not ro:
+            venue.set_position(account, coin, 4000.0, px)
+            sent.append(px)
+            return ConnectionError('502 Bad Gateway')
+        return NotImplemented
+    venue.script('order', fill_then_502, times=1)
+    venue.script('user_state', lambda *a: _flat_state() if sent else NotImplemented, times=1)   # one lagging read
+    loop = htl.HostedTradingLoop(FakePool(db))
+    assert await loop.execute_trade(make_user(db, creds), make_signal(db)) is True
+    assert len(entry_orders(venue)) == 1                                   # never re-sent
+    assert venue.szi(WALLET, 'ADA') == 4000.0
+    assert [a[3] for a in trigger_orders(venue)] == [4000.0, 4000.0]
+    assert next(iter(db.positions.values()))['quantity'] == 4000.0
+
+
+async def test_qc_mf2_entry_exception_on_every_attempt_records_needs_recovery_not_a_rowless_failure(venue, db, creds, notes, fast_sleep):
+    """QC money-followers-2 (final-attempt variant): an IOC that raises is never re-sent; with no position seen the
+    ENTRY_UNCONFIRMED needs_recovery path owns it (never 'Entry Order Failed' with no row)."""
+    venue.script('order', lambda a, c, b, sz, px, ot, ro: ConnectionError('connection dropped')
+                 if 'limit' in ot and not ro else NotImplemented)
+    loop = htl.HostedTradingLoop(FakePool(db))
+    assert await loop.execute_trade(make_user(db, creds), make_signal(db)) is False
+    assert len(entry_orders(venue)) == 1
+    [row] = [r for r in db.positions.values() if r['status'] == 'needs_recovery']
+    assert row['entry_order_id'] == 'unknown-after-exception' and row['quantity'] == 4000.0
+    assert db.errors('ENTRY_UNCONFIRMED')
+    assert not any('Entry Order Failed' in t for t, _, _ in notes)
+
+
+async def test_qc_mf2_live_size_above_the_bracket_is_alarmed_and_recorded_at_the_live_size(venue, db, creds, notes, fast_sleep):
+    """QC money-followers-2 (cross-check): the IOC reports totalSz 4000 but the account holds 8000 -> a critical
+    ENTRY_SIZE_MISMATCH, and the row carries the live size so follower_guard.select_row is not ambiguous (the
+    enforce guardian then re-sizes the SL)."""
+    def double(account, coin, is_buy, sz, px, otype, ro):
+        if 'limit' in otype and not ro:
+            venue.set_position(account, coin, 8000.0, px)
+            return fake_hl.ok_status({'filled': {'totalSz': '4000', 'avgPx': str(px), 'oid': 91}})
+        return NotImplemented
+    venue.script('order', double, times=1)
+    loop = htl.HostedTradingLoop(FakePool(db))
+    assert await loop.execute_trade(make_user(db, creds), make_signal(db)) is True
+    row = next(iter(db.positions.values()))
+    assert (row['status'], row['quantity']) == ('open', 8000.0)
+    assert db.errors('ENTRY_SIZE_MISMATCH')
+    assert any(t == 'ENTRY_SIZE_MISMATCH (HL)' and lvl == 'error' for t, lvl, _ in notes)
+    assert follower_guard.select_row([row], bracket_guard.Pos(1, 8000.0, 0.5, None), 1.0)[1] is None
 
 
 # ---------------------------------------------------------------- coordinator amendments (CA-B8-*)

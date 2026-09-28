@@ -19,7 +19,7 @@ import asyncio
 import functools
 import logging
 import os
-from typing import Any, Awaitable, Callable, Dict, Optional
+from typing import Any, Dict, Optional
 from datetime import datetime
 
 import aiohttp
@@ -177,16 +177,17 @@ async def place_entry_order_with_retry(
     limit_price: float,
     user_email: str = "unknown",
     user_api_key: str = "unknown",
-    confirm_position_fn: Optional[Callable[[], Awaitable[bool]]] = None
+    resend_after_exception: bool = True
 ) -> Optional[Dict]:
     """
     Place IOC entry order with retry (market-like execution with slippage protection).
     
     Hyperliquid: exchange.order(coin, is_buy, sz, limit_px, {"limit": {"tif": "Ioc"}})
-    Double-entry guard (Wave 1, C43): after an EXCEPTION (timeout / network: the IOC may have filled) and
-    confirm_position_fn() returning True (a position exists, or the read failed) the entry is NOT re-sent;
-    {'id': 'unknown-after-exception', 'raw': None} is returned and execute_trade confirms the fill.
-    An HL 'error' status (rejected, nothing filled) keeps today's retry.
+    Double-entry guard (Wave 1, C43; QC money-followers-2): with resend_after_exception=False (execute_trade) an
+    EXCEPTION (timeout / 5xx / dropped connection: the IOC may have filled) is NEVER re-sent, whatever a position
+    read says (a read one round trip later can lag a block and show flat); {'id': 'unknown-after-exception',
+    'raw': None} is returned and execute_trade confirms the fill from user_state (ENTRY_UNCONFIRMED ->
+    needs_recovery when none is seen). An HL 'error' status (rejected, nothing filled) keeps today's retry.
     """
     backoff = INITIAL_BACKOFF
     last_error = None
@@ -245,10 +246,9 @@ async def place_entry_order_with_retry(
             error_msg = str(e)[:200]
             attempts_log.append(f"Attempt {attempt}: {error_msg}")
             logger.warning(f"⚠️ Entry failed (attempt {attempt}/{MAX_RETRIES}): {error_msg}")
-            if confirm_position_fn is not None and not isinstance(e, HLOrderRejected):
-                if await confirm_position_fn():
-                    logger.critical("🚨 Entry raised but a position may exist - NOT re-sending (double-entry guard)")
-                    return {"id": "unknown-after-exception", "raw": None}
+            if not resend_after_exception and not isinstance(e, HLOrderRejected):
+                logger.critical("🚨 Entry raised - the IOC may have filled - NOT re-sending (double-entry guard)")
+                return {"id": "unknown-after-exception", "raw": None}
             
             if attempt < MAX_RETRIES:
                 logger.info(f"⏳ Retrying in {backoff:.1f}s...")
