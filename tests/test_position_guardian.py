@@ -285,6 +285,20 @@ async def test_qc_voice1_a_shadow_sl_at_a_moved_level_is_not_reported_missing(g,
     assert db.errors('GUARDIAN_WOULD_PLACE_SL') and not db.errors('GUARDIAN_SHADOW_SL_MISSING')
 
 
+async def test_qc_voice15_every_full_pass_logs_a_guardian_pass_heartbeat(g, db, venue, creds, caplog):
+    """QC voice-15: the 48 h shadow review needs proof that each pass ran and evaluated users."""
+    caplog.set_level(logging.INFO, logger='POSITION_GUARDIAN')
+    _, tp = bracket(venue)
+    venue.external_cancel(WALLET, _)
+    open_row(g, db, sl_order_id='111', tp_order_id=str(tp))
+    venue.set_position(WALLET, 'ADA', 4000.0, 0.5)
+    db.add_user(8, encrypt=creds)                                            # active, flat, no rows: screen only
+    await run_pass(g, dry=True)
+    [line] = [r.getMessage() for r in caplog.records if r.getMessage().startswith('GUARDIAN_PASS ')]
+    assert 'dry=True users=2/2 books_read=1 would=' in line and 'read_failures=0 elapsed=' in line
+    assert 'would=0' not in line
+
+
 async def test_enforce_builds_one_exchange_per_user_with_cached_meta_and_meters_everything(g, db, venue):
     sl, tp = bracket(venue)
     venue.external_cancel(WALLET, sl)

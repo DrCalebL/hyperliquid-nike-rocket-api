@@ -145,6 +145,7 @@ class HLPositionGuardian:
         self._marks_failures = {}        # 'lane' | 'pass' -> consecutive failed meta_and_asset_ctxs (voice-5)
         self._lane_defer = None          # during a lane tick's first phase: user_id -> coins awaiting CONFIRM_FLAT
         self._lane_books = {}            # during its second phase: user_id -> the book re-read after the shared sleep
+        self._pass_stats = None          # counters of the running full pass (the GUARDIAN_PASS heartbeat, voice-15)
         self._last_weight_log = None
 
     # ------------------------------------------------------------------ clocks (tests override)
@@ -305,10 +306,16 @@ class HLPositionGuardian:
         except GuardianBudget:
             raise
         except Exception as e:
+            if not lane:
+                self._count('read_failures')
             return await self._read_failed(user, 'GUARDIAN_READ_FAILED', error=repr(e)[:200])
         if not self._book_recognised(raw, state):
+            if not lane:
+                self._count('read_failures')
             return await self._read_failed(user, 'GUARDIAN_READ_UNKNOWN', where='book')
         self._read_failures[uid] = 0
+        if not lane:
+            self._count('books')
         return raw, state
 
     async def _read_failed(self, user, code, **ctx):
@@ -742,6 +749,7 @@ class HLPositionGuardian:
                 await self._restore_open(user, coin, row, pos)
             return
         if dry:
+            self._count('would', len(acts))
             for a in acts:
                 await self._alarm(user, coin, 'GUARDIAN_WOULD_' + a.kind, 'info', code=a.code, level=a.level,
                                   qty=a.qty, oid=a.leg.oid if a.leg is not None else None)
@@ -879,7 +887,24 @@ class HLPositionGuardian:
             await self._sleep(max(1.0, PASS_S - (self._clock() - t0)))
 
     async def _pass(self, dry, start, deadline):
-        """One full pass. Returns the round-robin index the next pass resumes from after GUARDIAN_BUDGET."""
+        """One full pass. Returns the round-robin index the next pass resumes from after GUARDIAN_BUDGET.
+        QC voice-15: every pass ends with a 'GUARDIAN_PASS dry=.. users=done/total books_read=.. would=..
+        read_failures=.. elapsed=..' heartbeat line, so a shadow review can tell 'ran, found nothing' from 'never ran'."""
+        t0 = self._clock()
+        self._pass_stats = stats = {'done': 0, 'users': 0, 'books': 0, 'would': 0, 'read_failures': 0}
+        try:
+            return await self._pass_body(dry, start, deadline)
+        finally:
+            self._pass_stats = None
+            logger.info('GUARDIAN_PASS dry=%s users=%d/%d books_read=%d would=%d read_failures=%d elapsed=%.1fs',
+                        dry, stats['done'], stats['users'], stats['books'], stats['would'], stats['read_failures'],
+                        self._clock() - t0)
+
+    def _count(self, key, n=1):
+        if self._pass_stats is not None:
+            self._pass_stats[key] += n
+
+    async def _pass_body(self, dry, start, deadline):
         t_start = self._clock()
         users = await self._fetch(SQL_PASS_USERS)
         rows = await self._fetch(SQL_PASS_ROWS)
@@ -897,6 +922,7 @@ class HLPositionGuardian:
             await self._alarm(None, '*', 'GUARDIAN_BUDGET', 'critical', done=0, users=len(order))
             return start
         n = len(order)
+        self._count('users', n)
         start %= n
         for k in range(n):
             i = (start + k) % n
@@ -905,10 +931,12 @@ class HLPositionGuardian:
                 return i
             try:
                 await self._pass_user(order[i], by_user.get(order[i]['user_id'], []), dry, deadline)
+                self._count('done')
             except GuardianBudget:
                 await self._alarm(None, '*', 'GUARDIAN_BUDGET', 'critical', done=k, users=n)
                 return i
             except Exception as e:
+                self._count('done')
                 await self._alarm(order[i], '*', 'GUARDIAN_EXCEPTION', 'critical', where='pass_user',
                                   error=repr(e)[:200])
         elapsed = self._clock() - t_start
@@ -955,10 +983,12 @@ class HLPositionGuardian:
         except GuardianBudget:
             raise
         except Exception as e:
+            self._count('read_failures')
             return await self._read_failed(user, 'GUARDIAN_READ_FAILED', where='screen', error=repr(e)[:200])
         try:
             live = self._live_coins(screen)
         except (AttributeError, TypeError, ValueError):
+            self._count('read_failures')
             return await self._read_failed(user, 'GUARDIAN_READ_UNKNOWN', where='screen')
         if not live and not self._needs_book(urows):
             self._read_failures[uid] = 0             # CA-B8-4: a recognised screen was this user's whole read
