@@ -63,6 +63,16 @@ accounts**. FastAPI, deployed on **Railway** (`railway.json`). **Postgres-backed
    `api_expiry_service.py` deactivates on, so UI and backend never disagree.
 4. **Customer creds are encrypted at rest** and API wallets expire (max 180d). Renewal is
    customer self-serve via `/setup?key=<nk_ key>` — the service never sees raw keys long-term.
+5. **Roll back the guardian with `GUARDIAN_MODE=off|shadow`, not a code redeploy.** Only the Wave 1
+   recovery lane (`position_guardian.py`, runs in every mode) acts on `open_positions` rows with
+   `status='needs_recovery'` (ENTRY_UNCONFIRMED, SL_/TP_FAILED_CLOSE_FAILED: possibly naked positions);
+   pre-Wave-1 builds ignore them. If a code rollback is unavoidable, first run
+   `SELECT id, user_id, hl_coin, reason FROM open_positions WHERE status='needs_recovery'` and resolve
+   each position by hand (close it or attach an SL).
+6. **error_logs names:** guardian rows are stored `GUARDIAN_<CODE>` (e.g. `GUARDIAN_ROW_AMBIGUOUS`),
+   entry-path rows bare (`NEEDS_RECOVERY_RECORDED`, `POSITION_RECORD_FAILED`, `EMERGENCY_CLOSE_FAILED`,
+   `HL_UNEXPECTED_STATUS`, ...). Query with the stored name.
+7. **`ADMIN_PASSWORD` has no default** (SEC-3): every admin route answers 503 until it is set on Railway.
 
 ## Gates (this repo)
 `python -m py_compile`; render the dashboard f-string in isolation (extract via `ast`, `eval`
