@@ -162,3 +162,20 @@ def test_broadcast_rejects_a_missing_risk_pct_with_422(client):
     r = client.post('/api/broadcast-signal', json=payload, headers=KEY)
     assert r.status_code == 422
     assert client.session.added == []
+
+
+# ---------------------------------------------------------------- SEC-2 (separate, owner-gated commit)
+def test_sec2_unset_master_key_returns_503_for_broadcast_and_admin_stats(client, monkeypatch):
+    monkeypatch.setattr(fe, 'MASTER_API_KEY', None)
+    assert client.post('/api/broadcast-signal', json=GOOD, headers=KEY).status_code == 503
+    assert client.get('/api/admin/stats', headers=KEY).status_code == 503
+    assert client.session.added == []
+
+
+def test_sec2_wrong_missing_or_non_ascii_key_is_401_and_the_right_key_passes(client):
+    assert client.post('/api/broadcast-signal', json=GOOD, headers={'x-master-key': 'nope'}).status_code == 401
+    assert client.post('/api/broadcast-signal', json=GOOD).status_code == 401
+    assert client.post('/api/broadcast-signal', json=GOOD, headers={'x-master-key': 'k\xe9y'.encode('latin-1')}).status_code == 401
+    assert client.session.added == []
+    assert client.post('/api/broadcast-signal', json=GOOD, headers=KEY).status_code == 200
+    assert client.get('/api/admin/stats', headers=KEY).status_code == 200

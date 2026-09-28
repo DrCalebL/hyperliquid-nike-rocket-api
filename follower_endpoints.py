@@ -56,7 +56,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 # Environment variables
-MASTER_API_KEY = os.getenv("MASTER_API_KEY", "your-master-key-here")
+MASTER_API_KEY = os.getenv("MASTER_API_KEY")  # SEC-2: no default; broadcasts are refused (503) while unset
 COINBASE_WEBHOOK_SECRET = os.getenv("COINBASE_WEBHOOK_SECRET", "")
 COINBASE_API_KEY = os.getenv("COINBASE_COMMERCE_API_KEY", "")
 
@@ -247,8 +247,10 @@ def get_db():
 
 
 def verify_master_key(x_master_key: str = Header(None)):
-    """Verify master API key from broadcasting algo"""
-    if x_master_key != MASTER_API_KEY:
+    """Verify master API key from broadcasting algo (SEC-2: no default key; constant-time compare)"""
+    if not MASTER_API_KEY:
+        raise HTTPException(status_code=503, detail="Broadcast disabled: MASTER_API_KEY not configured")
+    if not (x_master_key and hmac.compare_digest(x_master_key.encode(), MASTER_API_KEY.encode())):
         raise HTTPException(status_code=401, detail="Invalid master API key")
     return True
 

@@ -37,3 +37,13 @@ def test_risk_pct_is_a_required_float():
     field = next(s for s in cls.body if isinstance(s, ast.AnnAssign) and s.target.id == 'risk_pct')
     assert ast.unparse(field.annotation) == 'float'
     assert field.value is None
+
+
+def test_sec2_master_key_has_no_default_and_is_compared_in_constant_time():
+    tree = _tree()
+    assign = next(n for n in tree.body if isinstance(n, ast.Assign)
+                  and any(getattr(t, 'id', None) == 'MASTER_API_KEY' for t in n.targets))
+    assert ast.unparse(assign.value) == "os.getenv('MASTER_API_KEY')"
+    fn = _func(tree, 'verify_master_key')
+    assert 'hmac.compare_digest' in {ast.unparse(c.func) for c in ast.walk(fn) if isinstance(c, ast.Call)}
+    assert 'status_code=503' in ast.unparse(fn) and 'status_code=401' in ast.unparse(fn)
