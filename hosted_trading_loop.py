@@ -54,7 +54,6 @@ from order_utils import (
     place_entry_order_with_retry,
     place_tp_order_with_retry,
     place_sl_order_with_retry,
-    cancel_order_with_retry,
     cancel_order_verified,
     first_status,
     notify_admin,
@@ -484,29 +483,37 @@ class HostedTradingLoop:
     async def execute_trade(self, user: Dict, signal: Dict) -> bool:
         """
         Execute trade for a user on Hyperliquid.
-        
+
         Position sizing formula (2% risk):
         - risk_amount = equity * risk_pct
         - risk_per_unit = |entry - stop_loss|
         - position_size = risk_amount / risk_per_unit
         - DO NOT multiply by leverage!
-        
-        3-order bracket:
-        1. IOC entry order (market-like with slippage protection)
-        2. TP trigger order (limit, reduce-only)
-        3. SL trigger order (market, reduce-only)
-        
-        Acknowledges signal at START to prevent race condition.
+
+        Wave 1 bracket flow: in-flight token -> acknowledge -> dedup (fail closed) -> IOC entry (never re-sent
+        while a position may exist) -> fill confirmation (totalSz, else user_state polls; no blind sleep) ->
+        SL (stop-market) FIRST -> TP -> INSERT 'open' sized to the confirmed fill. Every exit reached after the
+        entry may have filled ends with an SL + an 'open' row, a verified-flat account with no service orders,
+        or a needs_recovery row for the guardian's recovery lane (I19).
         """
+        tok = follower_guard.mark(user['id'])          # I12: FIRST statement - before acknowledgment and dedup
+        try:
+            return await self._execute_trade_body(user, signal)
+        finally:
+            follower_guard.clear(user['id'], tok)        # A6: follower_guard also ends the token with this task
+
+    async def _execute_trade_body(self, user: Dict, signal: Dict) -> bool:
         user_api_key = user['api_key']
         user_short = user_api_key[:15] + "..."
         delivery_id = signal.get('delivery_id')
-        
+        stage = 'pre_entry'   # 'entry_sent' once the IOC returned an order; 'done' after the INSERT attempt,
+        post = {}             # a needs_recovery record, or a verified-flat clean exit
+
         # ==================== EARLY ACKNOWLEDGMENT ====================
         if delivery_id:
             await self.acknowledge_signal(delivery_id)
             self.logger.info(f"   🔒 {user_short}: Signal acknowledged (preventing re-execution)")
-        
+
         try:
             # Get exchange
             try:
@@ -518,14 +525,14 @@ class HostedTradingLoop:
                     str(cred_error), {"signal_id": signal.get('signal_id')}
                 )
                 return False
-            
+
             # Convert symbol
             api_symbol = signal['symbol']
             coin = convert_symbol_to_hl(api_symbol)
-            
+
             self.logger.info(f"   📊 {user_short}: Executing {signal['action']} {api_symbol} (coin={coin})")
-            
-            # ===== SAFETY CHECK =====
+
+            # ===== SAFETY CHECK (fail closed) =====
             has_open, reason = await self.check_any_open_positions_or_orders(
                 info, exchange, wallet_address, user_short,
                 user_id=user['id'], signal_id=signal.get('signal_id')
@@ -533,13 +540,13 @@ class HostedTradingLoop:
             if has_open:
                 self.logger.warning(f"   ⏭️ {user_short}: SKIPPING TRADE - {reason}")
                 return False
-            
+
             # Get equity
             equity = await self.get_user_equity(info, wallet_address)
             if equity <= 0:
                 self.logger.error(f"   ❌ {user_short}: No equity found")
                 return False
-            
+
             # ==================== VALIDATE SL/TP ====================
             if not signal.get('stop_loss') or not signal.get('take_profit'):
                 missing = []
@@ -548,61 +555,63 @@ class HostedTradingLoop:
                 self.logger.error(f"   ❌ {user_short}: Signal missing {', '.join(missing)}")
                 await notify_signal_invalid(signal.get('signal_id'), signal.get('symbol'), signal.get('action'), missing, f"Missing: {', '.join(missing)}")
                 return False
-            
+
             # Extract signal data
             action = signal['action']  # BUY or SELL
             entry_price = float(signal['entry_price'])
             stop_loss = float(signal['stop_loss'])
             take_profit = float(signal['take_profit'])
             leverage = float(signal.get('leverage', 5.0))
-            
+
             # Validate values
             if stop_loss <= 0 or take_profit <= 0:
                 self.logger.error(f"   ❌ {user_short}: Invalid SL ({stop_loss}) or TP ({take_profit})")
                 await notify_signal_invalid_values(signal.get('signal_id'), signal.get('symbol'), action, entry_price, stop_loss, take_profit, "Zero or negative")
                 return False
-            
+
             risk_pct = float(signal.get('risk_pct', DEFAULT_RISK_PERCENTAGE))
-            
+
             # ==================== POSITION SIZING ====================
             risk_amount = equity * risk_pct
             risk_per_unit = abs(entry_price - stop_loss)
-            
+
             if risk_per_unit <= 0:
                 self.logger.error(f"   ❌ {user_short}: Invalid SL distance")
                 await notify_signal_invalid_values(signal.get('signal_id'), signal.get('symbol'), action, entry_price, stop_loss, take_profit, f"SL distance zero")
                 return False
-            
+
             # Position size = risk amount / risk per unit (NO leverage multiplication!)
             position_size = risk_amount / risk_per_unit
             quantity = self.round_size(coin, position_size)
-            
+
             if quantity <= 0:
                 self.logger.error(f"   ❌ {user_short}: Position size rounds to 0")
                 return False
-            
+
             position_value = quantity * entry_price
-            
+
             self.logger.info(f"   💰 Equity: ${equity:,.2f}")
-            self.logger.info(f"   🎯 Risk: ${risk_amount:,.2f} ({risk_pct*100:.0f}%)")
+            self.logger.info(f"   🎯 Risk: ${risk_amount:,.2f} ({risk_pct*100:.2f}%)")
             self.logger.info(f"   📐 Position: {quantity} {coin} @ {leverage}x leverage")
             self.logger.info(f"   💵 Position value: ${position_value:,.2f}, Margin needed: ${position_value/leverage:,.2f}")
-            
+
             # ==================== SET LEVERAGE ====================
             try:
+                hl_rate.charge(hl_rate.W_ACTION, 'trading')
                 exchange.update_leverage(int(leverage), coin, is_cross=True)
                 self.logger.info(f"   ⚙️ Leverage set to {int(leverage)}x")
             except Exception as e:
                 self.logger.warning(f"   ⚠️ Could not set leverage: {e}")
-            
-            # ==================== EXECUTE 3-ORDER BRACKET ====================
-            
+
+            # ==================== EXECUTE 3-ORDER BRACKET (SL FIRST) ====================
+
             is_buy = action.upper() == 'BUY'
             user_email = user.get('email', 'unknown')
-            
+
             # 1. Entry IOC order (market-like with slippage)
             # Use LIVE mid price for IOC limit, not stale signal entry price
             try:
+                hl_rate.charge(hl_rate.W_ALL_MIDS, 'trading')
                 all_mids = info.all_mids()
                 live_price = float(all_mids.get(coin, 0))
                 if live_price <= 0:
@@ -613,86 +622,134 @@ class HostedTradingLoop:
             except Exception as e:
                 self.logger.warning(f"   ⚠️ Live price fetch failed: {e}, using signal entry")
                 live_price = entry_price
-            
+
             slippage_mult = 1 + (SLIPPAGE_BPS / 10000) if is_buy else 1 - (SLIPPAGE_BPS / 10000)
             entry_limit_price = self.round_price(live_price * slippage_mult)
-            
+
             self.logger.info(f"   📝 Placing entry IOC order...")
             entry_order = await place_entry_order_with_retry(
                 exchange=exchange, coin=coin, is_buy=is_buy,
                 quantity=quantity, limit_price=entry_limit_price,
-                user_email=user_email, user_api_key=user_api_key
+                user_email=user_email, user_api_key=user_api_key,
+                confirm_position_fn=functools.partial(self._position_may_exist, info, wallet_address, coin)
             )
-            
+
             if not entry_order:
                 self.logger.error(f"   ❌ Entry order FAILED - ABORTING TRADE")
                 await log_error_to_db(self.db_pool, user_api_key, "ENTRY_ORDER_FAILED",
                     "Entry failed after all retries", {"coin": coin, "side": action, "quantity": quantity})
                 return False
-            
+
+            stage = 'entry_sent'
+            post.update(info=info, exchange=exchange, wallet=wallet_address, coin=coin, side=action.upper(),
+                        qty=quantity, leverage=leverage, entry_order_id=str(entry_order.get('id')),
+                        entry_fill_price=entry_order.get('avgPx'), sl_oid=None, tp_oid=None)
             self.logger.info(f"   ✅ Entry: {entry_order['id']}")
-            
-            # Wait for fill confirmation
-            await asyncio.sleep(2)
-            
-            # 2. Take-profit trigger order (limit, reduce-only)
-            tp_price = self.round_price(take_profit)
-            self.logger.info(f"   📝 Placing take-profit order...")
-            tp_order = await place_tp_order_with_retry(
-                exchange=exchange, coin=coin, is_buy=not is_buy,
-                quantity=quantity, tp_price=tp_price,
-                user_email=user_email, user_api_key=user_api_key
-            )
-            
-            if not tp_order:
-                self.logger.error(f"   ❌ TP order FAILED - EMERGENCY CLOSE!")
-                await self._emergency_close_position(
-                    exchange, info, wallet_address, coin, not is_buy, quantity,
-                    user_email, user_api_key, entry_order['id'],
-                    reason="TP order failed after all retries"
-                )
+
+            # ==================== CONFIRM THE FILL (no blind sleep) ====================
+            bracket_qty, confirmed_px = await self._confirm_entry_fill(info, wallet_address, coin, is_buy, entry_order)
+            if bracket_qty is None:
+                # No bracket is sent: HL reduce-only triggers can rest on a flat account and block dedup CHECK 2.
+                self.logger.critical(f"   🚨 ENTRY_UNCONFIRMED: no {coin} position seen - recording needs_recovery")
+                await self._record_unprotected_position(
+                    user, signal, coin, action.upper(), quantity, leverage, entry_order.get('id'),
+                    entry_order.get('avgPx'), reason='ENTRY_UNCONFIRMED')
+                await log_error_to_db(self.db_pool, user_api_key, "ENTRY_UNCONFIRMED",
+                    f"No {coin} position after the IOC (oid {entry_order.get('id')}); no bracket sent",
+                    {"coin": coin, "side": action, "quantity": quantity})
+                await notify_admin(
+                    title="ENTRY_UNCONFIRMED (HL)",
+                    details={"User": user_email, "Coin": coin, "Side": action, "Quantity": quantity,
+                             "Entry Order": entry_order.get('id'),
+                             "Handling": "needs_recovery row written; the guardian recovery lane owns it"},
+                    level="error")
+                stage = 'done'
                 return False
-            
-            self.logger.info(f"   ✅ TP @ ${tp_price}: {tp_order['id']}")
-            
-            # 3. Stop-loss trigger order (market, reduce-only)
+            if bracket_qty < quantity:
+                self.logger.warning(f"   ⚠️ Partial fill: confirmed {bracket_qty} < requested {quantity}; bracket sized to {bracket_qty}")
+            entry_fill_price = entry_order.get('avgPx') or confirmed_px or entry_price
+            post.update(qty=bracket_qty, entry_fill_price=entry_fill_price)
+
+            # 2. Stop-loss trigger order FIRST (market, reduce-only), sized to the confirmed fill
             sl_price = self.round_price(stop_loss)
             self.logger.info(f"   📝 Placing stop-loss order...")
             sl_order = await place_sl_order_with_retry(
                 exchange=exchange, coin=coin, is_buy=not is_buy,
-                quantity=quantity, sl_price=sl_price,
+                quantity=bracket_qty, sl_price=sl_price,
                 user_email=user_email, user_api_key=user_api_key
             )
-            
+
             if not sl_order:
                 self.logger.error(f"   ❌ SL order FAILED - EMERGENCY CLOSE!")
-                # Cancel orphaned TP first
-                try:
-                    await cancel_order_with_retry(exchange, coin, int(tp_order['id']), "Orphaned TP")
-                except Exception:
-                    pass
-                await self._emergency_close_position(
-                    exchange, info, wallet_address, coin, not is_buy, quantity,
+                closed = await self._emergency_close_position(
+                    exchange, info, wallet_address, coin, not is_buy, bracket_qty,
                     user_email, user_api_key, entry_order['id'],
                     reason="SL order failed after all retries"
                 )
+                if not closed:
+                    await self._record_unprotected_position(
+                        user, signal, coin, action.upper(), bracket_qty, leverage, entry_order.get('id'),
+                        entry_fill_price, reason='SL_FAILED_CLOSE_FAILED')
+                stage = 'done'
                 return False
-            
-            self.logger.info(f"   ✅ SL @ ${sl_price}: {sl_order['id']}")
-            
+
+            sl_oid = str(sl_order['id'])
+            post['sl_oid'] = sl_oid
+            self.logger.info(f"   ✅ SL @ ${sl_price}: {sl_oid}")
+
+            # 3. Take-profit trigger order SECOND (limit, reduce-only)
+            tp_price = self.round_price(take_profit)
+            self.logger.info(f"   📝 Placing take-profit order...")
+            tp_order = await place_tp_order_with_retry(
+                exchange=exchange, coin=coin, is_buy=not is_buy,
+                quantity=bracket_qty, tp_price=tp_price,
+                user_email=user_email, user_api_key=user_api_key
+            )
+
+            if tp_order:
+                post['tp_oid'] = str(tp_order['id'])
+                self.logger.info(f"   ✅ TP @ ${tp_price}: {tp_order['id']}")
+            elif follower_guard.guardian_mode(GUARDIAN_MODES) == 'enforce':
+                # Keep the SL-protected position: the guardian re-places the TP (TP-failure-keep, enforce only)
+                self.logger.error(f"   ❌ TP order FAILED - keeping the SL-protected position (GUARDIAN_MODE=enforce)")
+                await log_error_to_db(self.db_pool, user_api_key, "TP_PLACE_FAILED",
+                    "TP failed after all retries; position kept under its SL, the guardian re-places the TP",
+                    {"coin": coin, "sl_order_id": sl_oid})
+                await notify_admin(
+                    title="TP_PLACE_FAILED - position kept under its SL (HL)",
+                    details={"User": user_email, "Coin": coin, "SL Order": sl_oid, "TP Price": tp_price},
+                    level="warning")
+            else:
+                # R3-M1: close FIRST while the SL is live; cancel the SL only once the close is verified flat
+                self.logger.error(f"   ❌ TP order FAILED - EMERGENCY CLOSE (SL kept until verified flat)")
+                closed = await self._emergency_close_position(
+                    exchange, info, wallet_address, coin, not is_buy, bracket_qty,
+                    user_email, user_api_key, entry_order['id'],
+                    reason="TP order failed after all retries", sl_placed=True
+                )
+                if closed:
+                    if not await cancel_order_verified(exchange, coin, sl_oid, 'Leftover SL after TP-failure close'):
+                        await self._record_unprotected_position(
+                            user, signal, coin, action.upper(), bracket_qty, leverage, entry_order.get('id'),
+                            entry_fill_price, sl_order_id=sl_oid, reason='LEFTOVER_SL_CANCEL_FAILED')
+                else:
+                    await self._record_unprotected_position(
+                        user, signal, coin, action.upper(), bracket_qty, leverage, entry_order.get('id'),
+                        entry_fill_price, sl_order_id=sl_oid, reason='TP_FAILED_CLOSE_FAILED')
+                stage = 'done'
+                return False
+
             # ==================== RECORD OPEN POSITION ====================
-            entry_fill_price = entry_order.get('avgPx', entry_price)
-            
             try:
                 async with self.db_pool.acquire() as conn:
                     signal_db_id = await conn.fetchval(
                         "SELECT id FROM signals WHERE signal_id = $1", signal.get('signal_id')
                     )
-                    
+
                     position_opened_at = datetime.utcnow()
-                    
+
                     await conn.execute("""
-                        INSERT INTO open_positions 
+                        INSERT INTO open_positions
                         (user_id, signal_id, entry_order_id, tp_order_id, sl_order_id,
                          symbol, hl_coin, side, quantity, leverage,
                          entry_fill_price, target_tp, target_sl, opened_at, status)
@@ -701,12 +758,12 @@ class HostedTradingLoop:
                         user['id'],
                         signal_db_id,
                         str(entry_order['id']),
-                        str(tp_order['id']),
-                        str(sl_order['id']),
+                        str(tp_order['id']) if tp_order else None,
+                        sl_oid,
                         signal['symbol'],   # BTC/USDT format
                         coin,               # BTC (HL format)
                         action.upper(),     # BUY or SELL
-                        quantity,
+                        bracket_qty,
                         leverage,
                         entry_fill_price,
                         tp_price,
@@ -714,26 +771,129 @@ class HostedTradingLoop:
                         position_opened_at,
                         'open'
                     )
-                    
+
                     # Start billing cycle if not started
                     await conn.execute("""
                         UPDATE follower_users SET billing_cycle_start = $2
                         WHERE id = $1 AND billing_cycle_start IS NULL
                     """, user['id'], position_opened_at)
-                    
+
                     self.logger.info(f"   📝 Open position recorded in database")
             except Exception as e:
                 self.logger.error(f"   ⚠️ Failed to record position (trade still placed): {e}")
-            
+                await log_error_to_db(self.db_pool, user_api_key, "POSITION_RECORD_FAILED",
+                    f"open_positions INSERT failed: {str(e)[:200]}", {"coin": coin, "sl_order_id": sl_oid})
+                await notify_admin(
+                    title="POSITION_RECORD_FAILED (HL)",
+                    details={"User": user_email, "Coin": coin, "Quantity": bracket_qty, "SL Order": sl_oid,
+                             "TP Order": post.get('tp_oid'), "Error": str(e)[:300],
+                             "Note": "The position keeps its SL (and TP); add the open_positions row manually"},
+                    level="error")
+            stage = 'done'
+
             self.logger.info(f"   🎉 {user_short}: Trade executed successfully!")
             return True
-            
+
         except Exception as e:
             self.logger.error(f"   ❌ {user_short}: Error - {type(e).__name__}: {str(e)[:100]}")
             await log_error_to_db(self.db_pool, user_api_key, "TRADE_EXECUTION_ERROR",
                 str(e)[:200], {"coin": convert_symbol_to_hl(signal.get('symbol', '')), "side": signal.get('action')})
+            if stage == 'entry_sent':
+                await self._post_entry_exception(user, signal, post, e)
             return False
-    
+
+    async def _position_may_exist(self, info, wallet_address: str, coin: str) -> bool:
+        """confirm_position_fn for the IOC entry: True when a `coin` position exists OR the read failed."""
+        try:
+            hl_rate.charge(hl_rate.W_USER_STATE, 'trading')
+            state = await asyncio.to_thread(info.user_state, wallet_address)
+            return coin_szi(state, coin) != 0
+        except Exception as e:
+            self.logger.warning(f"   ⚠️ Position check after an entry exception failed: {e} (assuming a position)")
+            return True
+
+    async def _confirm_entry_fill(self, info, wallet_address: str, coin: str, is_buy: bool, entry_order: Dict):
+        """
+        C40.2: (bracket_qty, entry_px). totalSz > 0 -> round_size(totalSz). Otherwise poll user_state every
+        ENTRY_CONFIRM_POLL_S for up to ENTRY_CONFIRM_TIMEOUT_S for a correctly signed szi. (None, None) when
+        still unconfirmed.
+        """
+        total_sz = float(entry_order.get('totalSz') or 0)
+        if total_sz > 0:
+            return self.round_size(coin, total_sz), None
+        polls = max(1, int(round(self.ENTRY_CONFIRM_TIMEOUT_S / self.ENTRY_CONFIRM_POLL_S)))
+        for i in range(polls):
+            if i:
+                await asyncio.sleep(self.ENTRY_CONFIRM_POLL_S)
+            try:
+                hl_rate.charge(hl_rate.W_USER_STATE, 'trading')
+                state = await asyncio.to_thread(info.user_state, wallet_address)
+                szi = coin_szi(state, coin)
+                if (szi > 0) if is_buy else (szi < 0):
+                    return self.round_size(coin, abs(szi)), coin_entry_px(state, coin)
+            except Exception as e:
+                self.logger.warning(f"   ⚠️ Fill confirmation read {i + 1}/{polls} failed: {e}")
+        return None, None
+
+    async def _verified_flat(self, info, wallet_address: str, coin: str) -> bool:
+        """Two symbol-matched user_state reads VERIFY_FLAT_GAP_S apart, both flat. Any read error -> False."""
+        for i in range(2):
+            if i:
+                await asyncio.sleep(self.VERIFY_FLAT_GAP_S)
+            try:
+                hl_rate.charge(hl_rate.W_USER_STATE, 'trading')
+                state = await asyncio.to_thread(info.user_state, wallet_address)
+                if coin_szi(state, coin) != 0:
+                    return False
+            except Exception:
+                return False
+        return True
+
+    async def _record_unprotected_position(self, user, signal, coin, side, qty, leverage, entry_order_id,
+                                           entry_fill_price, sl_order_id=None, tp_order_id=None, reason=''):
+        """R3-H1: a needs_recovery row carrying the signal levels, the qty and every known service leg id."""
+        try:
+            async with self.db_pool.acquire() as conn:
+                sig_id = await conn.fetchval('SELECT id FROM signals WHERE signal_id = $1', signal.get('signal_id'))
+                await conn.execute(
+                    "INSERT INTO open_positions (user_id, signal_id, entry_order_id, tp_order_id, sl_order_id, symbol, hl_coin, side, "
+                    "quantity, leverage, entry_fill_price, target_tp, target_sl, opened_at, status) "
+                    "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,NOW(),'needs_recovery')",
+                    user['id'], sig_id, str(entry_order_id or 'unknown'), tp_order_id, sl_order_id, signal['symbol'], coin, side,
+                    qty, leverage, entry_fill_price, self.round_price(float(signal['take_profit'])), self.round_price(float(signal['stop_loss'])))
+            await log_error_to_db(self.db_pool, user['api_key'], 'NEEDS_RECOVERY_RECORDED', reason, {'coin': coin})
+            await notify_admin(title='Position recorded for guardian recovery (HL)', details={'User': user.get('email'), 'Coin': coin, 'Reason': reason}, level='error')
+        except Exception as e:
+            self.logger.critical(f'   ❌ needs_recovery INSERT failed: {e}')
+            await notify_admin(title='NEEDS_RECOVERY_RECORD_FAILED (HL)', details={'User': user.get('email'), 'Coin': coin, 'Reason': reason, 'Error': str(e)[:300]}, level='error')
+
+    async def _post_entry_exception(self, user, signal, post, err):
+        """
+        R3-H1: an exception after the IOC returned an order. Coin open or unknown -> needs_recovery row with the
+        known leg ids; verified flat (two reads 2 s apart) -> cancel the known service legs, and a failed cancel
+        -> needs_recovery row carrying the leftover ids.
+        """
+        reason = f"POST_ENTRY_EXCEPTION:{type(err).__name__}"
+        try:
+            coin = post['coin']
+            self.logger.critical(f"   🚨 {reason} after the entry was sent ({coin}): {str(err)[:200]}")
+            await log_error_to_db(self.db_pool, user['api_key'], 'POST_ENTRY_EXCEPTION', f"{reason}: {str(err)[:300]}", {'coin': coin})
+            await notify_admin(title='POST_ENTRY_EXCEPTION (HL)', details={'User': user.get('email'), 'Coin': coin, 'Error': f"{reason}: {str(err)[:300]}"}, level='error')
+            args = (user, signal, coin, post['side'], post['qty'], post['leverage'], post['entry_order_id'], post.get('entry_fill_price'))
+            if not await self._verified_flat(post['info'], post['wallet'], coin):
+                await self._record_unprotected_position(*args, sl_order_id=post.get('sl_oid'), tp_order_id=post.get('tp_oid'), reason=reason)
+                return
+            leftover = {}
+            for key, label in (('sl_oid', 'SL'), ('tp_oid', 'TP')):
+                oid = post.get(key)
+                if oid and not await cancel_order_verified(post['exchange'], coin, oid, f'{label} after a post-entry exception'):
+                    leftover[key] = oid
+            if leftover:
+                await self._record_unprotected_position(*args, sl_order_id=leftover.get('sl_oid'), tp_order_id=leftover.get('tp_oid'), reason='POST_ENTRY_EXCEPTION_LEFTOVER')
+        except Exception as e:
+            self.logger.critical(f"   ❌ post-entry recovery handling failed: {e}")
+            await notify_admin(title='POST_ENTRY_EXCEPTION handling failed (HL)', details={'User': user.get('email'), 'Error': str(e)[:300], 'Original': str(err)[:300]}, level='error')
+
     async def _emergency_close_position(
         self, exchange, info, wallet_address, coin, is_buy_to_close, quantity,
         user_email, user_api_key, entry_order_id, reason, sl_placed=False
