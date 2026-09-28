@@ -4,6 +4,7 @@ T26 (R3-H1, I19, AC23): every execute_trade exit reached after the entry may hav
 the qty and every known service leg id - plus the A3 cancel check and the A6 in-flight age alarm.
 """
 import asyncio
+import threading
 from datetime import timedelta
 
 import pytest
@@ -12,6 +13,7 @@ from tests.fakes import fake_hl
 from tests.fakes.fake_hl import creds, fast_sleep, notes, venue  # noqa: F401  (pytest fixtures)
 from tests.fakes.fake_pool import FakeDB, FakePool
 
+import bracket_guard as bg
 import follower_guard
 import hl_rate
 import hosted_trading_loop as htl
@@ -471,6 +473,132 @@ async def test_a1_a_full_pass_blocked_on_the_meter_does_not_delay_the_lane(g, db
     pass_task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await pass_task
+
+
+# ---------------------------------------------------------------- QC Wave 1: lane latency, stalls, blind (A1)
+def many_flat_rows(g, db, creds, n):
+    """n other users, each with a flat ENTRY_UNCONFIRMED needs_recovery row opened BEFORE user 7's row."""
+    for uid in range(100, 100 + n):
+        db.add_user(uid, encrypt=creds)
+        nr_row(g, db, user_id=uid, opened_at=g.world.t - timedelta(seconds=60))
+
+
+@pytest.mark.parametrize('mode', ['shadow', 'enforce'])
+async def test_qc_a1_flat_rows_ahead_never_delay_a_naked_row(g, db, venue, creds, mode):
+    """QC correctness-followers-1 / money-followers-4: 40 flat needs_recovery rows ahead of a naked one used to
+    cost 5 s each before the lane reached it (200 s). Rows with a live position are acted on before the one
+    shared FLAT_CONFIRM_S sleep of the tick."""
+    many_flat_rows(g, db, creds, 40)
+    row = nr_row(g, db)
+    venue.set_position(WALLET, 'ADA', 4000.0, 0.5)
+    seen = []
+    g.world.on_sleep.append(lambda: seen.append((db.positions[row['id']]['status'],
+                                                 [a[5] for a in venue.order_calls() if 'trigger' in a[5]])))
+    await tick(g, mode)
+    assert g.world.slept.count(bg.FLAT_CONFIRM_S) == 1                     # one shared confirm sleep per tick
+    status, triggers = seen[0]                                               # state at the first sleep
+    if mode == 'shadow':
+        assert status == 'closed'
+    else:
+        assert triggers and triggers[0] == order_utils.sl_order_type(0.45)
+
+
+async def test_qc_a1_flat_rows_are_still_confirmed_and_closed_manual_after_240s(g, db, venue, creds):
+    many_flat_rows(g, db, creds, 5)
+    for _ in range(9):
+        await tick(g, 'shadow')
+    assert {r['status'] for r in db.positions.values()} == {'closed_manual'}
+    assert lane_mutations(venue) == []
+
+
+async def test_qc_a1_a_position_appearing_during_the_shared_confirm_is_acted_on(g, db, venue):
+    row = nr_row(g, db)
+    g.world.on_sleep.append(lambda: venue.set_position(WALLET, 'ADA', 4000.0, 0.5))
+    await tick(g, 'shadow')                                                  # flat, then live on the confirm read
+    assert db.positions[row['id']]['status'] == 'closed' and venue.szi(WALLET, 'ADA') == 0.0
+
+
+def test_qc_guardian_builds_info_and_exchange_with_a_request_timeout(venue, db, creds, monkeypatch):
+    """QC correctness-followers-4 / coverage-followers-1: the SDK default timeout=None lets one half-open request
+    block the lane forever; the guardian's own Info and Exchange carry timeout=HL_TIMEOUT_S."""
+    seen = []
+
+    class RecInfo(fake_hl.Info):
+        def __init__(self, *a, timeout=None, **k):
+            seen.append(('Info', timeout))
+            super().__init__(*a, timeout=timeout, **k)
+
+    class RecExchange(fake_hl.Exchange):
+        def __init__(self, *a, timeout=None, **k):
+            seen.append(('Exchange', timeout))
+            super().__init__(*a, timeout=timeout, **k)
+    monkeypatch.setattr(pg, 'Info', RecInfo)
+    monkeypatch.setattr(pg, 'Exchange', RecExchange)
+    guardian = pg.HLPositionGuardian(FakePool(db))
+    db.add_user(7, encrypt=creds)
+    user = dict(user_id=7, **{k: db.users[7][k] for k in ('api_key', 'email', 'hl_private_key_encrypted',
+                                                           'hl_wallet_address', 'api_wallet_expires_at')})
+
+    async def build():
+        await guardian._refresh_marks(lane=True)
+        await guardian._exchange(user, 'ADA', lane=True)
+    asyncio.run(build())
+    guardian._pool.shutdown(wait=False)
+    assert seen == [('Info', pg.HL_TIMEOUT_S), ('Exchange', pg.HL_TIMEOUT_S)] and 0 < pg.HL_TIMEOUT_S <= 15
+
+
+async def test_qc_a_hung_lane_request_raises_guardian_lane_stall_and_the_lane_resumes(g, db, venue, notes, monkeypatch):
+    """QC coverage-followers-1 / money-followers-4: a lane tick that never finishes (a request that never answers)
+    is cut off after LANE_STALL_S with a critical GUARDIAN_LANE_STALL, and the next tick acts on the row."""
+    monkeypatch.setattr(pg, 'LANE_STALL_S', 0.3)
+    release, calls = threading.Event(), []
+
+    def hang(*a):
+        calls.append(1)
+        if len(calls) == 1:
+            release.wait(10)                                                 # the first read never answers
+        return NotImplemented
+    venue.script('frontend_open_orders', hang)
+    row = nr_row(g, db)
+    venue.set_position(WALLET, 'ADA', 4000.0, 0.5)
+    ticks = []
+
+    def stop():
+        ticks.append(1)
+        if db.positions[row['id']]['status'] == 'closed' or len(ticks) > 5:
+            raise _Stop()
+    g.world.on_sleep.append(stop)
+    try:
+        with pytest.raises(_Stop):
+            await g._lane_loop()
+    finally:
+        release.set()
+    assert db.errors('GUARDIAN_LANE_STALL')
+    assert any(t == 'GUARDIAN_LANE_STALL (HL)' and lvl == 'error' for t, lvl, _ in notes)
+    assert db.positions[row['id']]['status'] == 'closed'
+
+
+async def test_qc_voice5_a_failing_marks_read_escalates_to_guardian_blind(g, db, venue, notes):
+    """QC voice-5 (I1): meta_and_asset_ctxs (or the Info constructor) failing every tick used to leave one hourly
+    warning row; BLIND_AFTER consecutive lane failures now raise a critical, notified GUARDIAN_BLIND."""
+    nr_row(g, db)
+    venue.set_position(WALLET, 'ADA', 4000.0, 0.5)
+    venue.script('meta_and_asset_ctxs', lambda *a: ConnectionError('info endpoint down'))
+    for _ in range(pg.BLIND_AFTER):
+        await tick(g, 'shadow')
+    [blind] = db.errors('GUARDIAN_BLIND')
+    assert blind['context']['where'] == 'lane_marks' and blind['context']['needs_recovery_rows'] == '1'
+    assert any(t == 'GUARDIAN_BLIND (HL)' and lvl == 'error' for t, lvl, _ in notes)
+
+
+async def test_qc_a_failing_marks_read_falls_back_to_cached_marks(g, db, venue):
+    """QC money-followers-4: one failed meta_and_asset_ctxs no longer aborts the tick once marks were cached."""
+    nr_row(g, db, user_id=7)
+    await tick(g, 'shadow')                                                  # marks cached (row flat)
+    venue.script('meta_and_asset_ctxs', lambda *a: ConnectionError('info endpoint down'))
+    venue.set_position(WALLET, 'ADA', 4000.0, 0.5)
+    await tick(g, 'shadow')
+    assert [r['status'] for r in db.positions.values()] == ['closed'] and venue.szi(WALLET, 'ADA') == 0.0
 
 
 # ---------------------------------------------------------------- coordinator amendments (CA-B8-*)

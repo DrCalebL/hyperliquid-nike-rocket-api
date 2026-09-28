@@ -13,6 +13,11 @@ RECOVERY LANE (every LANE_S=30 s, in EVERY GUARDIAN_MODE incl. 'off'; A1: its ow
     AND TP resting at the row's recorded levels restore the row to 'open' instead of closing;
   - flat: 'closed_manual' only after 240 s of confirmed flat (5 s CONFIRM re-reads), after cancelling the row's
     own leg ids.
+  QC Wave 1 (A1 bound): a tick is two-phase - every lane user is read and every row with a live position is acted
+  on first; the flat rows' CONFIRM re-reads then share ONE FLAT_CONFIRM_S sleep (never 5 s per row). Each tick is
+  cut off after LANE_STALL_S (critical GUARDIAN_LANE_STALL); the guardian's Info / Exchange carry
+  timeout=HL_TIMEOUT_S; a failed meta_and_asset_ctxs falls back to the cached marks, and BLIND_AFTER consecutive
+  failures of it raise GUARDIAN_BLIND (lane and pass alike).
 
 FULL PASS (every PASS_S=240 s; shadow = log-only 'GUARDIAN_WOULD_*', enforce = acts; 'off' = none)
   Never within 180 s of a new signal (GUARDIAN_PASS_DEFERRED_SIGNAL). Users with an 'open' row first, then other
@@ -33,6 +38,7 @@ codes also notify_admin, deduped per (user, coin, code) per hour.
 """
 import asyncio
 import functools
+import inspect
 import logging
 import math
 import os
@@ -67,6 +73,9 @@ RECENT_CLOSED_S = 3600.0
 CANNOT_TRADE_S = 3600.0
 POOL_WORKERS = 2
 BLIND_AFTER = 3
+HL_TIMEOUT_S = 10.0              # QC: requests timeout for the guardian's Info / Exchange (the SDK default is None)
+LANE_STALL_S = 150.0             # QC: a lane tick running longer is cut off with a critical GUARDIAN_LANE_STALL
+MARKS_FRESH_S = 120.0            # QC: cached marks older than this never serve as the CLOSE-by-price reference
 SL_YIELDED = 'yielded'           # CA-B8-1: _place_sl's third outcome (the user went in flight between attempts)
 GUARDIAN = hl_rate.GUARDIAN_SOURCE
 EVENT_CODES = frozenset({'SL_REPAIRED', 'TP_REPAIRED', 'GUARDIAN_CLOSE', 'GUARDIAN_RECOVERY_CLOSE',
@@ -102,6 +111,14 @@ SQL_ROW_TP = ("/* hlg:row_tp */ UPDATE open_positions SET tp_order_id = $2 "
               "WHERE id = $1 AND status IN ('open', 'needs_recovery')")
 
 
+def _takes(cls, name):
+    """True when cls(...) accepts the keyword `name` (the installed SDK's Info / Exchange take timeout=)."""
+    try:
+        return name in inspect.signature(cls.__init__).parameters
+    except (TypeError, ValueError):
+        return False
+
+
 class GuardianBudget(Exception):
     """The meter held a full-pass read past the pass budget (GUARDIAN_BUDGET)."""
 
@@ -124,6 +141,10 @@ class HLPositionGuardian:
         self._cannot_trade_until = {}    # user_id -> epoch
         self._clean_rows = set()         # closed row ids whose legs were verified gone
         self._next_start = 0             # full-pass round-robin resume index
+        self._marks_at = None            # epoch of the last successful meta_and_asset_ctxs
+        self._marks_failures = {}        # 'lane' | 'pass' -> consecutive failed meta_and_asset_ctxs (voice-5)
+        self._lane_defer = None          # during a lane tick's first phase: user_id -> coins awaiting CONFIRM_FLAT
+        self._lane_books = {}            # during its second phase: user_id -> the book re-read after the shared sleep
         self._last_weight_log = None
 
     # ------------------------------------------------------------------ clocks (tests override)
@@ -148,12 +169,17 @@ class HLPositionGuardian:
         while True:
             t0 = self._clock()
             try:
-                await self._recovery_lane(follower_guard.guardian_mode(MODES))
-                await self._report_expired_tokens()
+                await asyncio.wait_for(self._lane_tick(follower_guard.guardian_mode(MODES)), timeout=LANE_STALL_S)
+            except asyncio.TimeoutError:
+                await self._alarm(None, '*', 'GUARDIAN_LANE_STALL', 'critical', stall_s=LANE_STALL_S)
             except Exception as e:
                 await self._alarm(None, '*', 'GUARDIAN_EXCEPTION', 'critical', where='lane', error=repr(e)[:200])
             self._log_weight_every(WEIGHT_LOG_S)
             await self._sleep(max(1.0, LANE_S - (self._clock() - t0)))
+
+    async def _lane_tick(self, mode):
+        await self._recovery_lane(mode)
+        await self._report_expired_tokens()
 
     async def _report_expired_tokens(self):
         """A6: follower_guard records a token that aged out while its execute_trade was still running; every lane
@@ -224,7 +250,8 @@ class HLPositionGuardian:
                 if not await hl_rate.acquire_background(hl_rate.W_CTOR_UNCACHED, GUARDIAN, max_wait_s=wait):
                     raise GuardianBudget()
             if self.info is None:
-                self.info = await self._call(Info, self.base_url, True)
+                kw = {'timeout': HL_TIMEOUT_S} if _takes(Info, 'timeout') else {}
+                self.info = await self._call(Info, self.base_url, True, **kw)
         return self.info
 
     async def _refresh_marks(self, lane, deadline=None):
@@ -243,6 +270,29 @@ class HLPositionGuardian:
             if px > 0:
                 marks[name] = px
         self._meta, self._marks, self._szd = meta, marks, szd
+        self._marks_at = self._epoch()
+
+    def _marks_fresh(self):
+        return self._marks_at is not None and self._epoch() - self._marks_at <= MARKS_FRESH_S
+
+    async def _marks_or_cached(self, where, lane, deadline=None, pending=None):
+        """meta_and_asset_ctxs for a lane tick / pass. A failure counts toward GUARDIAN_BLIND (QC voice-5: the
+        per-user streak never sees it) and falls back to the cached marks when there are any (QC money-followers-4).
+        True when the caller may go on reading."""
+        try:
+            await self._refresh_marks(lane=lane, deadline=deadline)
+        except GuardianBudget:
+            raise
+        except Exception as e:
+            n = self._marks_failures[where] = self._marks_failures.get(where, 0) + 1
+            await self._alarm(None, '*', 'GUARDIAN_READ_FAILED', 'warning', where=where + '_marks',
+                              error=repr(e)[:200])
+            if n >= BLIND_AFTER:
+                ctx = {'needs_recovery_rows': pending} if pending is not None else {}
+                await self._alarm(None, '*', 'GUARDIAN_BLIND', 'critical', where=where + '_marks', failures=n, **ctx)
+            return self.info is not None and self._meta is not None
+        self._marks_failures[where] = 0
+        return True
 
     async def _read_book(self, user, wallet, lane, deadline=None):
         """I1: orders FIRST, position SECOND. (raw_orders, state), or None after GUARDIAN_READ_FAILED (a read
@@ -390,6 +440,8 @@ class HLPositionGuardian:
             kwargs.update(meta=self._meta, spot_meta=self._spot_meta)
         else:
             hl_rate.charge(hl_rate.W_CTOR_UNCACHED, GUARDIAN)
+        if _takes(Exchange, 'timeout'):
+            kwargs['timeout'] = HL_TIMEOUT_S
         ex = await self._call(Exchange, acct, self.base_url, **kwargs)
         self._ex[uid] = ex
         return ex
@@ -462,14 +514,23 @@ class HLPositionGuardian:
         return follower_guard.fills_show_new_entry(fills, row_side(row), since, row.get('entry_order_id'))
 
     async def _confirm_flat(self, user, wallet, coin, lane, deadline=None, since=None):
-        """CONFIRM_FLAT: 5 s later re-read orders FIRST and position SECOND. (confirmed, legs, pos)."""
-        await self._sleep(bg.FLAT_CONFIRM_S)
-        if await self._busy(user['user_id'], since=since):
-            await self._yield(user, coin)
+        """CONFIRM_FLAT: 5 s later re-read orders FIRST and position SECOND. (confirmed, legs, pos).
+        Lane ticks (QC A1 bound): in the first phase the coin is only queued for the tick's one shared
+        FLAT_CONFIRM_S sleep; in the second phase the book re-read after that sleep is the confirmation."""
+        uid = user['user_id']
+        if lane and self._lane_defer is not None:
+            self._lane_defer.setdefault(uid, set()).add(coin)
             return False, None, None
-        book = await self._read_book(user, wallet, lane, deadline)
-        if book is None:
-            return False, None, None
+        if lane and uid in self._lane_books:
+            book = self._lane_books[uid]
+        else:
+            await self._sleep(bg.FLAT_CONFIRM_S)
+            if await self._busy(uid, since=since):
+                await self._yield(user, coin)
+                return False, None, None
+            book = await self._read_book(user, wallet, lane, deadline)
+            if book is None:
+                return False, None, None
         pos, legs = self._pos(book[1], coin), self._legs(book[0], coin)
         return (pos is None and legs is not bg.UNKNOWN), legs, pos
 
@@ -481,34 +542,64 @@ class HLPositionGuardian:
         by_user = {}
         for r in rows:
             by_user.setdefault(r['user_id'], []).append(r)
+        if not await self._marks_or_cached('lane', lane=True, pending=len(rows)):
+            return
+        # QC A1 bound: phase 1 reads every user and acts on every live position; flat rows only queue their
+        # CONFIRM_FLAT. Phase 2: ONE shared FLAT_CONFIRM_S sleep, then one re-read per queued user.
+        self._lane_defer, self._lane_books = {}, {}
         try:
-            await self._refresh_marks(lane=True)
-        except Exception as e:
-            return await self._alarm(None, '*', 'GUARDIAN_READ_FAILED', 'warning', where='lane_marks',
-                                     error=repr(e)[:200])
-        for nr_rows in by_user.values():
-            try:
-                await self._lane_user(mode, nr_rows)
-            except Exception as e:
-                await self._alarm(nr_rows[0], '*', 'GUARDIAN_EXCEPTION', 'critical', where='lane_user',
-                                  error=repr(e)[:200])
+            for nr_rows in by_user.values():
+                await self._lane_guarded(self._lane_user(mode, nr_rows), nr_rows[0])
+            deferred, self._lane_defer = self._lane_defer, None
+            if deferred:
+                await self._sleep(bg.FLAT_CONFIRM_S)
+                for uid, coins in deferred.items():
+                    await self._lane_guarded(self._lane_confirm_user(mode, by_user[uid], coins), by_user[uid][0])
+        finally:
+            self._lane_defer, self._lane_books = None, {}
 
-    async def _lane_user(self, mode, nr_rows):
-        user = nr_rows[0]                            # lane rows carry the user's columns
+    async def _lane_guarded(self, coro, user):
+        try:
+            await coro
+        except Exception as e:
+            await self._alarm(user, '*', 'GUARDIAN_EXCEPTION', 'critical', where='lane_user', error=repr(e)[:200])
+
+    async def _lane_confirm_user(self, mode, nr_rows, coins):
+        """Phase 2 of a lane tick: the CONFIRM re-read (orders FIRST, position SECOND) of the coins queued in phase 1,
+        made after the tick's shared FLAT_CONFIRM_S sleep; the pair logic then runs on it."""
+        user = nr_rows[0]
         uid = user['user_id']
         since = max(r['opened_at'] for r in nr_rows)
         if await self._busy(uid, since=since):
             return await self._yield(user)
         wallet = self._wallet(user)
         if wallet is None:
-            return await self._alarm(user, '*', 'GUARDIAN_CANNOT_TRADE', 'critical', error='no wallet address')
+            return
         book = await self._read_book(user, wallet, lane=True)
         if book is None:
             return
+        self._lane_books[uid] = book
+        await self._lane_user(mode, nr_rows, book=book, coins=coins)
+
+    async def _lane_user(self, mode, nr_rows, book=None, coins=None):
+        user = nr_rows[0]                            # lane rows carry the user's columns
+        uid = user['user_id']
+        since = max(r['opened_at'] for r in nr_rows)
+        if book is None:
+            if await self._busy(uid, since=since):
+                return await self._yield(user)
+            wallet = self._wallet(user)
+            if wallet is None:
+                return await self._alarm(user, '*', 'GUARDIAN_CANNOT_TRADE', 'critical', error='no wallet address')
+            book = await self._read_book(user, wallet, lane=True)
+            if book is None:
+                return
+        else:
+            wallet = self._wallet(user)
         if await self._busy(uid, since=since):
             return await self._yield(user)
         rows = await self._fetch(SQL_USER_ROWS, uid)
-        for coin in sorted({self._coin(r) for r in nr_rows}):
+        for coin in sorted(coins if coins is not None else {self._coin(r) for r in nr_rows}):
             pair = [r for r in rows if self._coin(r) == coin]
             await self._lane_pair(mode, user, wallet, coin, pair, book[0], book[1], since)
 
@@ -612,7 +703,7 @@ class HLPositionGuardian:
         and that [] must never reach the empty-plan restore below: it would set a naked row to 'open' (I17, I19)."""
         uid = user['user_id']
         tick, lot = self._tick(coin), self._lot(coin)
-        mark = self._marks.get(coin)
+        mark = self._marks.get(coin) if self._marks_fresh() else None
         ref = {'mark': mark} if mark else {}
         now = self._epoch()
         in_flight = await self._busy(uid, since=since)
@@ -792,12 +883,10 @@ class HLPositionGuardian:
         if not order:
             return 0
         try:
-            await self._refresh_marks(lane=False, deadline=deadline)
+            if not await self._marks_or_cached('pass', lane=False, deadline=deadline):
+                return start
         except GuardianBudget:
             await self._alarm(None, '*', 'GUARDIAN_BUDGET', 'critical', done=0, users=len(order))
-            return start
-        except Exception as e:
-            await self._alarm(None, '*', 'GUARDIAN_READ_FAILED', 'warning', where='pass_marks', error=repr(e)[:200])
             return start
         n = len(order)
         start %= n
