@@ -15,13 +15,34 @@ Hyperliquid's real limit is 1200 weight/min per IP; the 700 ceiling keeps headro
 """
 import asyncio
 import collections
+import logging
+import math
 import os
 import threading
 import time
 
+
+def _env_int(name, default, lo, hi):
+    """QC regression-followers-2: an owner-tuned variable never stops the service importing. Blank, non-numeric or
+    non-finite -> default; '700.0' -> 700; clamped to [lo, hi]. A replaced or clamped value is logged."""
+    raw = os.getenv(name)
+    try:
+        value = float(raw)
+        if not math.isfinite(value):
+            raise ValueError(raw)
+        value = int(value)
+    except (TypeError, ValueError):
+        value = default
+    used = min(max(value, lo), hi)
+    if raw is not None and str(raw).strip() != str(used):
+        logging.getLogger('HL_RATE').warning('%s=%r is not a plain integer in [%d, %d]; using %d',
+                                             name, raw, lo, hi, used)
+    return used
+
+
 WINDOW_S = 60.0
-CEILING = int(os.getenv('HL_WEIGHT_CEILING', '700'))
-GUARDIAN_PER_MIN = int(os.getenv('HL_GUARDIAN_WEIGHT_PER_MIN', '300'))
+CEILING = _env_int('HL_WEIGHT_CEILING', 700, 1, 1200)                 # Hyperliquid's own limit is 1200/min per IP
+GUARDIAN_PER_MIN = _env_int('HL_GUARDIAN_WEIGHT_PER_MIN', 300, 1, 1200)
 GUARDIAN_SOURCE = 'guardian'
 
 # Hyperliquid request weights (spec C45 WEIGHTS)

@@ -216,3 +216,31 @@ def test_position_monitor_differs_from_base_only_by_charge_lines_and_the_import(
                      if not (line.strip().startswith('hl_rate.charge(') or line.strip() == 'import hl_rate'))
     assert hashlib.sha256(kept.encode('utf-8')).hexdigest() == POSITION_MONITOR_BASE_SHA256
     assert 'import hl_rate' in text.split('\n')
+
+
+# ---------------------------------------------------------------- QC regression-followers-2: tolerant env parsing
+@pytest.mark.parametrize('raw, expected', [(None, 700), ('', 700), ('  ', 700), ('700.0', 700), ('750', 750),
+                                           ('abc', 700), ('nan', 700), ('inf', 700), ('0', 1), ('-5', 1),
+                                           ('5000', 1200)])
+def test_qc_env_int_never_raises_and_clamps(monkeypatch, raw, expected):
+    """A blank or '700.0' HL_WEIGHT_CEILING used to stop main.py importing (int() at import time), taking the
+    broadcast endpoint, trading loop and position_monitor down with it."""
+    if raw is None:
+        monkeypatch.delenv('QC_TEST_HL_ENV', raising=False)
+    else:
+        monkeypatch.setenv('QC_TEST_HL_ENV', raw)
+    assert hl_rate._env_int('QC_TEST_HL_ENV', 700, 1, 1200) == expected
+
+
+def test_qc_hl_rate_imports_with_malformed_variables(monkeypatch):
+    import importlib
+    monkeypatch.setenv('HL_WEIGHT_CEILING', '')
+    monkeypatch.setenv('HL_GUARDIAN_WEIGHT_PER_MIN', '300.0')
+    try:
+        importlib.reload(hl_rate)
+        assert (hl_rate.CEILING, hl_rate.GUARDIAN_PER_MIN) == (700, 300)
+    finally:
+        monkeypatch.delenv('HL_WEIGHT_CEILING')
+        monkeypatch.delenv('HL_GUARDIAN_WEIGHT_PER_MIN')
+        importlib.reload(hl_rate)
+    assert (hl_rate.CEILING, hl_rate.GUARDIAN_PER_MIN) == (700, 300)
