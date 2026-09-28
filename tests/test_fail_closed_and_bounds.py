@@ -63,6 +63,28 @@ async def test_open_order_still_blocks_as_today(venue, db, notes):
     assert has_open is True and reason == 'Open orders exist: 1 orders'
 
 
+@pytest.mark.parametrize('shape', [None, {}, {'error': 'Could not parse JSON: <html>502</html>'},
+                                   {'assetPositions': None}, {'assetPositions': [{'position': {'szi': 'n/a'}}]}])
+async def test_qc_mf6_an_unrecognised_position_shape_fails_closed(venue, db, notes, shape):
+    """QC money-followers-6 (C42): a 2xx user_state with an unrecognised body (None, {}, the SDK's
+    {'error': 'Could not parse JSON: ...'}, unparsable szi) is a read error, never 'no position'."""
+    loop = htl.HostedTradingLoop(FakePool(db))
+    venue.set_position(WALLET, 'ADA', 4000.0, 0.5)
+    venue.script('user_state', lambda *a: shape)
+    has_open, reason = await _dedup(loop, loop.info)
+    assert has_open is True and reason.startswith('Position check failed')
+    assert db.errors('DEDUP_SKIPPED_READ_ERROR')
+
+
+@pytest.mark.parametrize('shape', [None, {'error': 'Could not parse JSON: <html>502</html>'}])
+async def test_qc_mf6_an_unrecognised_orders_shape_fails_closed(venue, db, notes, shape):
+    loop = htl.HostedTradingLoop(FakePool(db))
+    venue.script('open_orders', lambda *a: shape)
+    has_open, reason = await _dedup(loop, loop.info)
+    assert has_open is True and reason.startswith('Order check failed')
+    assert db.errors('DEDUP_SKIPPED_READ_ERROR')
+
+
 async def test_a_read_error_sends_no_entry(venue, db, creds, notes, fast_sleep):
     user = db.add_user(7, encrypt=creds)
     s = db.add_signal('sig-1')

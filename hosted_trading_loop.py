@@ -443,17 +443,19 @@ class HostedTradingLoop:
             try:
                 hl_rate.charge(hl_rate.W_USER_STATE, 'trading')
                 state = info.user_state(wallet_address)
-                if state and 'assetPositions' in state:
-                    for pos in state['assetPositions']:
-                        position = pos.get('position', {})
-                        szi = float(position.get('szi', 0))
-                        if abs(szi) > 0:
-                            coin = position.get('coin', 'Unknown')
-                            side = 'LONG' if szi > 0 else 'SHORT'
-                            self.logger.warning(
-                                f"   🚫 {user_short}: Found open position - {coin} {side} ({abs(szi)} units)"
-                            )
-                            return (True, f"Open position exists: {coin} {side}")
+                if not isinstance(state, dict) or not isinstance(state.get('assetPositions'), list):
+                    # QC money-followers-6: None, {}, the SDK's {'error': 'Could not parse JSON: ...'} -> read error
+                    raise ValueError(f"unrecognised user_state shape: {str(state)[:120]}")
+                for pos in state['assetPositions']:
+                    position = pos.get('position', {})
+                    szi = float(position.get('szi', 0))
+                    if abs(szi) > 0:
+                        coin = position.get('coin', 'Unknown')
+                        side = 'LONG' if szi > 0 else 'SHORT'
+                        self.logger.warning(
+                            f"   🚫 {user_short}: Found open position - {coin} {side} ({abs(szi)} units)"
+                        )
+                        return (True, f"Open position exists: {coin} {side}")
             except Exception as e:
                 self.logger.warning(f"   ⚠️ {user_short}: Error fetching positions: {e}")
                 await log_error_to_db(self.db_pool, user_short, "DEDUP_SKIPPED_READ_ERROR",
@@ -464,7 +466,9 @@ class HostedTradingLoop:
             try:
                 hl_rate.charge(hl_rate.W_OPEN_ORDERS, 'trading')
                 open_orders = info.open_orders(wallet_address)
-                if open_orders and len(open_orders) > 0:
+                if not isinstance(open_orders, list):
+                    raise ValueError(f"unrecognised open_orders shape: {str(open_orders)[:120]}")   # QC money-followers-6
+                if len(open_orders) > 0:
                     coins_with_orders = set(o.get('coin', 'Unknown') for o in open_orders)
                     self.logger.warning(
                         f"   🚫 {user_short}: Found {len(open_orders)} open order(s) on: {', '.join(coins_with_orders)}"
