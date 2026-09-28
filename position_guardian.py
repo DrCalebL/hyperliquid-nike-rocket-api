@@ -795,11 +795,21 @@ class HLPositionGuardian:
                 first.append(u)
             elif u.get('agent_active') or any(r['status'] in ACTIVE_STATUSES for r in rows):
                 second.append(u)
-            elif any(r['status'] not in ACTIVE_STATUSES and r['id'] not in self._clean_rows
-                     and row_ts(r.get('last_fill_at')) is not None and now - row_ts(r['last_fill_at']) < RECENT_CLOSED_S
-                     for r in rows):
+            elif any(self._unverified_recent_close(r, now) for r in rows):
                 third.append(u)
         return first + second + third
+
+    def _unverified_recent_close(self, r, now):
+        """A row closed within RECENT_CLOSED_S (last_fill_at) whose legs are not yet verified gone from the book."""
+        ts = row_ts(r.get('last_fill_at'))
+        return (r['status'] not in ACTIVE_STATUSES and r['id'] not in self._clean_rows
+                and ts is not None and now - ts < RECENT_CLOSED_S)
+
+    def _needs_book(self, urows):
+        """CA-B8-2 (capacity): besides a live position, only an active row or an unverified row closed within
+        60 min earns the full book read (frontend_open_orders 20 + user_state 2) after the 2-weight screen."""
+        now = self._epoch()
+        return any(r['status'] in ACTIVE_STATUSES or self._unverified_recent_close(r, now) for r in urows)
 
     async def _pass_user(self, user, urows, dry, deadline):
         uid = user['user_id']
@@ -815,7 +825,7 @@ class HLPositionGuardian:
             raise
         except Exception as e:
             return await self._alarm(user, '*', 'GUARDIAN_READ_FAILED', 'warning', where='screen', error=repr(e)[:200])
-        if not live and not urows:
+        if not live and not self._needs_book(urows):
             return
         book = await self._read_book(user, wallet, lane=False, deadline=deadline)
         if book is None:

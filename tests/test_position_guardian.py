@@ -537,3 +537,22 @@ async def test_ca_b8_1_a_yield_between_sl_attempts_stops_the_plan_before_any_can
     assert old_sl in [o['oid'] for o in venue.orders(WALLET, 'ADA')]
     assert len([a for a in venue.order_calls() if 'trigger' in a[5]]) == 1    # no SL retry after the yield
     assert db.errors('GUARDIAN_YIELD_INFLIGHT') and not db.errors('GUARDIAN_SL_REPAIRED')
+
+
+async def test_ca_b8_2_a_flat_user_with_only_old_closed_rows_gets_the_screen_read_only(g, db, venue):
+    """CA-B8-2 (capacity): no live position, no active row and no unverified row closed within 60 min -> no book."""
+    db.add_position(user_id=7, status='closed', sl_order_id='111', opened_at=g.world.t - timedelta(days=2),
+                    last_fill_at=g.world.t - timedelta(days=2))
+    await run_pass(g)
+    assert [n for t, n, _ in venue.calls if t == 'info'] == ['meta_and_asset_ctxs', 'user_state']
+
+
+async def test_ca_b8_2_a_recently_closed_row_gets_the_book_until_verified_clean(g, db, venue):
+    db.add_position(user_id=7, status='closed', sl_order_id='111', opened_at=g.world.t - timedelta(hours=1),
+                    last_fill_at=g.world.t - timedelta(minutes=10))
+    await run_pass(g)
+    assert 'frontend_open_orders' in venue.names('info')                       # closed 10 min ago, not yet verified
+    venue.calls.clear()
+    g.world.advance(pg.PASS_S)
+    await run_pass(g)                                                          # verified clean by the first book
+    assert [n for t, n, _ in venue.calls if t == 'info'] == ['meta_and_asset_ctxs', 'user_state']
