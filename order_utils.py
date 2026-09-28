@@ -16,12 +16,15 @@ Author: Nike Rocket Team
 """
 
 import asyncio
+import functools
 import logging
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Awaitable, Callable, Dict, Optional
 from datetime import datetime
 
 import aiohttp
+
+import hl_rate
 
 # Setup logging
 logger = logging.getLogger("ORDER_UTILS")
@@ -30,6 +33,45 @@ logger = logging.getLogger("ORDER_UTILS")
 MAX_RETRIES = 3
 INITIAL_BACKOFF = 1.0  # seconds
 MAX_BACKOFF = 8.0  # seconds
+
+
+# ==================== WAVE 1 HELPERS (shared with hosted_trading_loop / position_guardian) ====================
+
+
+class HLOrderRejected(Exception):
+    """Hyperliquid answered and rejected the order (nothing filled): the entry may be retried as today."""
+
+
+def sl_order_type(trigger_px: float) -> Dict:
+    """Stop-loss trigger dict (stop-MARKET): the entry path and the guardian send exactly this."""
+    return {"trigger": {"isMarket": True, "triggerPx": trigger_px, "tpsl": "sl"}}
+
+
+def tp_order_type(trigger_px: float) -> Dict:
+    """Take-profit trigger dict (trigger-LIMIT at the level): the entry path and the guardian send exactly this."""
+    return {"trigger": {"isMarket": False, "triggerPx": trigger_px, "tpsl": "tp"}}
+
+
+def first_status(result):
+    """statuses[0] of a Hyperliquid exchange response, or None for any other shape."""
+    try:
+        return ((result.get("response") or {}).get("data") or {}).get("statuses", [None])[0]
+    except (AttributeError, IndexError, TypeError):
+        return None
+
+
+def cancel_result_ok(result) -> bool:
+    """A3: True only for statuses[0] == 'success' or an error saying the order no longer rests
+    (already canceled / filled / never placed). An envelope 'ok' with any other inner error is a FAILURE."""
+    if not isinstance(result, dict) or result.get("status") != "ok":
+        return False
+    st = first_status(result)
+    if st == "success":
+        return True
+    if isinstance(st, dict):
+        err = str(st.get("error", "")).lower()
+        return "already canceled" in err or "never placed" in err or "filled" in err
+    return False
 
 # Resend email configuration
 RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
@@ -134,12 +176,17 @@ async def place_entry_order_with_retry(
     quantity: float,
     limit_price: float,
     user_email: str = "unknown",
-    user_api_key: str = "unknown"
+    user_api_key: str = "unknown",
+    confirm_position_fn: Optional[Callable[[], Awaitable[bool]]] = None
 ) -> Optional[Dict]:
     """
     Place IOC entry order with retry (market-like execution with slippage protection).
     
     Hyperliquid: exchange.order(coin, is_buy, sz, limit_px, {"limit": {"tif": "Ioc"}})
+    Double-entry guard (Wave 1, C43): after an EXCEPTION (timeout / network: the IOC may have filled) and
+    confirm_position_fn() returning True (a position exists, or the read failed) the entry is NOT re-sent;
+    {'id': 'unknown-after-exception', 'raw': None} is returned and execute_trade confirms the fill.
+    An HL 'error' status (rejected, nothing filled) keeps today's retry.
     """
     backoff = INITIAL_BACKOFF
     last_error = None
@@ -149,6 +196,7 @@ async def place_entry_order_with_retry(
         try:
             logger.info(f"📝 Placing Entry IOC order (attempt {attempt}/{MAX_RETRIES})...")
             
+            hl_rate.charge(hl_rate.W_ACTION, 'trading')
             result = exchange.order(
                 coin, is_buy, quantity, limit_price,
                 {"limit": {"tif": "Ioc"}}
@@ -182,19 +230,24 @@ async def place_entry_order_with_retry(
                     }
                 elif statuses and "error" in statuses[0]:
                     error_msg = statuses[0]["error"]
-                    raise Exception(f"HL order error: {error_msg}")
+                    raise HLOrderRejected(f"HL order error: {error_msg}")
                 else:
-                    # Unknown status but OK - treat as success
+                    # Unknown status but OK - treat as success (execute_trade confirms the fill)
                     logger.warning(f"⚠️ Entry returned ok but unexpected statuses: {statuses}")
+                    await _notify_unexpected_status("Entry", coin, statuses, user_email, user_api_key)
                     return {"id": "unknown", "raw": result}
             else:
-                raise Exception(f"HL order failed: status={status}, response={response}")
+                raise HLOrderRejected(f"HL order failed: status={status}, response={response}")
             
         except Exception as e:
             last_error = e
             error_msg = str(e)[:200]
             attempts_log.append(f"Attempt {attempt}: {error_msg}")
             logger.warning(f"⚠️ Entry failed (attempt {attempt}/{MAX_RETRIES}): {error_msg}")
+            if confirm_position_fn is not None and not isinstance(e, HLOrderRejected):
+                if await confirm_position_fn():
+                    logger.critical("🚨 Entry raised but a position may exist - NOT re-sending (double-entry guard)")
+                    return {"id": "unknown-after-exception", "raw": None}
             
             if attempt < MAX_RETRIES:
                 logger.info(f"⏳ Retrying in {backoff:.1f}s...")
@@ -245,9 +298,10 @@ async def place_tp_order_with_retry(
         try:
             logger.info(f"📝 Placing TP order (attempt {attempt}/{MAX_RETRIES})...")
             
+            hl_rate.charge(hl_rate.W_ACTION, 'trading')
             result = exchange.order(
                 coin, is_buy, quantity, tp_price,
-                {"trigger": {"isMarket": False, "triggerPx": tp_price, "tpsl": "tp"}},
+                tp_order_type(tp_price),
                 reduce_only=True
             )
             
@@ -266,6 +320,7 @@ async def place_tp_order_with_retry(
                     raise Exception(f"HL TP error: {error_msg}")
                 else:
                     logger.warning(f"⚠️ TP returned ok but unexpected statuses: {statuses}")
+                    await _notify_unexpected_status("TP", coin, statuses, user_email, user_api_key)
                     return {"id": "unknown", "raw": result}
             else:
                 raise Exception(f"HL TP failed: status={status}, response={response}")
@@ -323,9 +378,10 @@ async def place_sl_order_with_retry(
         try:
             logger.info(f"📝 Placing SL order (attempt {attempt}/{MAX_RETRIES})...")
             
+            hl_rate.charge(hl_rate.W_ACTION, 'trading')
             result = exchange.order(
                 coin, is_buy, quantity, sl_price,
-                {"trigger": {"isMarket": True, "triggerPx": sl_price, "tpsl": "sl"}},
+                sl_order_type(sl_price),
                 reduce_only=True
             )
             
@@ -344,6 +400,7 @@ async def place_sl_order_with_retry(
                     raise Exception(f"HL SL error: {error_msg}")
                 else:
                     logger.warning(f"⚠️ SL returned ok but unexpected statuses: {statuses}")
+                    await _notify_unexpected_status("SL", coin, statuses, user_email, user_api_key)
                     return {"id": "unknown", "raw": result}
             else:
                 raise Exception(f"HL SL failed: status={status}, response={response}")
@@ -395,6 +452,7 @@ async def cancel_order_with_retry(
     
     for attempt in range(1, MAX_RETRIES + 1):
         try:
+            hl_rate.charge(hl_rate.W_ACTION, 'trading')
             result = exchange.cancel(coin, order_id)
             
             status = result.get("status", "")
@@ -434,6 +492,61 @@ async def cancel_order_with_retry(
         )
     
     return False
+
+
+async def cancel_order_verified(
+    exchange,
+    coin: str,
+    order_id,
+    order_description: str = "Order",
+    executor=None,
+    source: str = "trading"
+) -> bool:
+    """
+    A3: cancel that trusts only the inner status (cancel_result_ok): 'success', or an error saying the order
+    no longer rests. 3 attempts with backoff; the SDK call runs on `executor` (the default executor when None);
+    every attempt is charged to hl_rate `source`. False for an unusable oid (e.g. 'unknown').
+    """
+    try:
+        oid = int(order_id)
+    except (TypeError, ValueError):
+        logger.error(f"❌ {order_description}: unusable oid {order_id!r} - cannot cancel")
+        return False
+    loop = asyncio.get_running_loop()
+    backoff = INITIAL_BACKOFF
+    last = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            hl_rate.charge(hl_rate.W_ACTION, source)
+            last = await loop.run_in_executor(executor, functools.partial(exchange.cancel, coin, oid))
+            if cancel_result_ok(last):
+                logger.info(f"✅ {order_description} cancelled (or already gone): oid={oid}")
+                return True
+            logger.warning(f"⚠️ {order_description} cancel not confirmed (attempt {attempt}/{MAX_RETRIES}): {str(last)[:200]}")
+        except Exception as e:
+            last = e
+            logger.warning(f"⚠️ {order_description} cancel raised (attempt {attempt}/{MAX_RETRIES}): {str(e)[:200]}")
+        if attempt < MAX_RETRIES:
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, MAX_BACKOFF)
+    logger.error(f"❌ Failed to cancel {order_description} oid={oid} after {MAX_RETRIES} attempts: {str(last)[:200]}")
+    return False
+
+
+async def _notify_unexpected_status(kind: str, coin: str, statuses, user_email: str, user_api_key: str):
+    """C43: an 'ok' envelope with unexpected statuses stays a success (raising could duplicate SLs); alarm it."""
+    logger.warning(f"⚠️ HL_UNEXPECTED_STATUS {kind} {coin}: {statuses}")
+    await notify_admin(
+        title=f"HL_UNEXPECTED_STATUS: {kind} returned ok with unexpected statuses (HL)",
+        details={
+            "User": user_email,
+            "API Key": user_api_key[:20] + "..." if len(user_api_key) > 20 else user_api_key,
+            "Coin": coin,
+            "Statuses": str(statuses)[:500],
+            "Handling": "Treated as success (id 'unknown'); the guardian verifies the legs",
+        },
+        level="warning"
+    )
 
 
 # ==================== CRITICAL FAILURE NOTIFICATIONS ====================
