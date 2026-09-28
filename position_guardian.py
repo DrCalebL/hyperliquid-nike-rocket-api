@@ -15,7 +15,10 @@ RECOVERY LANE (every LANE_S=30 s, in EVERY GUARDIAN_MODE incl. 'off'; A1: its ow
     own leg ids.
   QC Wave 1 (A1 bound): a tick is two-phase - every lane user is read and every row with a live position is acted
   on first; the flat rows' CONFIRM re-reads then share ONE FLAT_CONFIRM_S sleep (never 5 s per row). Each tick is
-  cut off after LANE_STALL_S (critical GUARDIAN_LANE_STALL); the guardian's Info / Exchange carry
+  cut off after LANE_STALL_S (critical GUARDIAN_LANE_STALL). QC round 2: phase 1 visits never-visited users
+  first (newest row first), then the least recently started, and starts no new user after LANE_PHASE1_S
+  (warning GUARDIAN_LANE_SLOW), so a slow or hung user never starves the rest and phase 2 still runs for the users
+  it read; the guardian's Info / Exchange carry
   timeout=HL_TIMEOUT_S; a failed meta_and_asset_ctxs falls back to the cached marks, and BLIND_AFTER consecutive
   failures of it raise GUARDIAN_BLIND (lane and pass alike).
 
@@ -75,6 +78,7 @@ POOL_WORKERS = 2
 BLIND_AFTER = 3
 HL_TIMEOUT_S = 10.0              # QC: requests timeout for the guardian's Info / Exchange (the SDK default is None)
 LANE_STALL_S = 150.0             # QC: a lane tick running longer is cut off with a critical GUARDIAN_LANE_STALL
+LANE_PHASE1_S = 90.0             # QC round 2: phase 1 starts no new user after this (warning GUARDIAN_LANE_SLOW)
 MARKS_FRESH_S = 120.0            # QC: cached marks older than this never serve as the CLOSE-by-price reference
 SL_YIELDED = 'yielded'           # CA-B8-1: _place_sl's third outcome (the user went in flight between attempts)
 GUARDIAN = hl_rate.GUARDIAN_SOURCE
@@ -141,6 +145,7 @@ class HLPositionGuardian:
         self._cannot_trade_until = {}    # user_id -> epoch
         self._clean_rows = set()         # closed row ids whose legs were verified gone
         self._next_start = 0             # full-pass round-robin resume index
+        self._lane_started = {}          # user_id -> clock when a lane tick last started the user (QC round 2)
         self._marks_at = None            # epoch of the last successful meta_and_asset_ctxs
         self._marks_failures = {}        # 'lane' | 'pass' -> consecutive failed meta_and_asset_ctxs (voice-5)
         self._lane_defer = None          # during a lane tick's first phase: user_id -> coins awaiting CONFIRM_FLAT
@@ -553,10 +558,21 @@ class HLPositionGuardian:
             return
         # QC A1 bound: phase 1 reads every user and acts on every live position; flat rows only queue their
         # CONFIRM_FLAT. Phase 2: ONE shared FLAT_CONFIRM_S sleep, then one re-read per queued user.
+        # QC round 2: never-visited users first (newest row first), then the least recently started, so a tick
+        # cut off by LANE_STALL_S (or stopped at LANE_PHASE1_S) never starves the same users tick after tick.
+        self._lane_started = {u: t for u, t in self._lane_started.items() if u in by_user}
+        order = sorted(by_user, key=lambda u: (self._lane_started.get(u, float('-inf')),
+                                               -max(row_ts(r['opened_at']) or 0.0 for r in by_user[u])))
         self._lane_defer, self._lane_books = {}, {}
+        t0 = self._clock()
         try:
-            for nr_rows in by_user.values():
-                await self._lane_guarded(self._lane_user(mode, nr_rows), nr_rows[0])
+            for i, uid in enumerate(order):
+                if self._clock() - t0 >= LANE_PHASE1_S:
+                    await self._alarm(None, '*', 'GUARDIAN_LANE_SLOW', 'warning', phase1_s=LANE_PHASE1_S,
+                                      users_left=len(order) - i)
+                    break
+                self._lane_started[uid] = self._clock()
+                await self._lane_guarded(self._lane_user(mode, by_user[uid]), by_user[uid][0])
             deferred, self._lane_defer = self._lane_defer, None
             if deferred:
                 await self._sleep(bg.FLAT_CONFIRM_S)

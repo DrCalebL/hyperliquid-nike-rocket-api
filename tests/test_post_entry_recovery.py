@@ -758,3 +758,81 @@ async def test_ca_b8_4_unrecognised_position_reads_in_the_lane_count_toward_guar
         await tick(g, 'shadow')
     assert lane_mutations(venue) == [] and db.positions[row['id']]['status'] == 'needs_recovery'
     assert db.errors('GUARDIAN_READ_UNKNOWN') and db.errors('GUARDIAN_BLIND')
+
+
+# ---------------------------------------------------------------- QC round 2 (hl-follower): lane starvation
+def _wallet(uid):
+    return '0x%040x' % uid
+
+
+async def test_qc_r2_a_lane_cut_every_tick_never_starves_the_newest_row(g, db, venue, creds, notes, monkeypatch):
+    """QC round 2: SQL_LANE_ROWS is ORDER BY opened_at and a cut tick restarted from the oldest user, so a user
+    whose read hangs every tick kept the newest (most urgent) needs_recovery row from ever being reached.
+    Never-visited users go first, newest row first, then the least recently started."""
+    monkeypatch.setattr(pg, 'LANE_STALL_S', 0.3)
+    many_flat_rows(g, db, creds, 3)                                          # users 100-102, older than user 7
+    release = threading.Event()
+    venue.script('frontend_open_orders', lambda addr, *a: release.wait(10) and NotImplemented
+                 if addr == _wallet(102) else NotImplemented)                # user 102's read hangs every tick
+    row = nr_row(g, db)
+    venue.set_position(WALLET, 'ADA', 4000.0, 0.5)
+    ticks = []
+
+    def stop():
+        ticks.append(1)
+        if db.positions[row['id']]['status'] == 'closed' or len(ticks) > 5:
+            raise _Stop()
+    g.world.on_sleep.append(stop)
+    try:
+        with pytest.raises(_Stop):
+            await g._lane_loop()
+    finally:
+        release.set()
+    assert db.positions[row['id']]['status'] == 'closed' and venue.szi(WALLET, 'ADA') == 0.0
+
+
+async def test_qc_r2_the_lane_rotates_past_a_user_that_hangs(g, db, venue, creds, monkeypatch):
+    """A newest user whose read hangs is started first once, then goes behind every user not yet started."""
+    monkeypatch.setattr(pg, 'LANE_STALL_S', 0.3)
+    row = nr_row(g, db, opened_at=g.world.t - timedelta(seconds=120))       # user 7: live, the OLDEST row
+    venue.set_position(WALLET, 'ADA', 4000.0, 0.5)
+    db.add_user(99, encrypt=creds)
+    nr_row(g, db, user_id=99)                                                # user 99: the newest row, hangs
+    release = threading.Event()
+    venue.script('frontend_open_orders', lambda addr, *a: release.wait(10) and NotImplemented
+                 if addr == _wallet(99) else NotImplemented)
+    for _ in range(2):
+        try:
+            await asyncio.wait_for(g._lane_tick('shadow'), timeout=pg.LANE_STALL_S)
+        except asyncio.TimeoutError:
+            pass
+    release.set()
+    assert db.positions[row['id']]['status'] == 'closed'
+
+
+async def test_qc_r2_a_slow_lane_stops_phase_one_and_still_confirms_the_users_it_read(g, db, venue, creds, notes):
+    """Phase 1 starts no new user after LANE_PHASE1_S (warning GUARDIAN_LANE_SLOW), so the tick's shared confirm
+    still runs for the users it did read; the next tick starts with the users it skipped."""
+    many_flat_rows(g, db, creds, 4)                                          # users 100-103
+    row = nr_row(g, db)                                                      # user 7, newest, live
+    venue.set_position(WALLET, 'ADA', 4000.0, 0.5)
+    slow = {_wallet(u) for u in range(100, 104)}
+
+    def slow_read(addr, *a):
+        if addr in slow:
+            g.world.advance(pg.LANE_PHASE1_S / 2 + 1)                        # each read eats half the budget
+        return NotImplemented
+    venue.script('frontend_open_orders', slow_read)
+
+    def read_order():
+        return [a[0] for t, n, a in venue.calls if n == 'frontend_open_orders']
+    await g._recovery_lane('shadow')
+    assert db.positions[row['id']]['status'] == 'closed'                     # the newest row went first
+    first = read_order()
+    assert first[:3] == [WALLET, _wallet(100), _wallet(101)] and _wallet(102) not in first
+    assert first[3:] == [_wallet(100), _wallet(101)]                         # the shared confirm re-reads ran
+    assert g.world.slept.count(bg.FLAT_CONFIRM_S) == 1
+    assert db.errors('GUARDIAN_LANE_SLOW')
+    venue.calls.clear()
+    await g._recovery_lane('shadow')
+    assert read_order()[:2] == [_wallet(102), _wallet(103)]
