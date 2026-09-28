@@ -139,7 +139,7 @@ class HLPositionGuardian:
         await self._sleep(START_DELAY_S)
         logger.info('🛡️ HL POSITION GUARDIAN STARTED mode=%s lane=%ds pass=%ds',
                     follower_guard.guardian_mode(MODES), LANE_S, PASS_S)
-        await self._lane_loop()
+        await asyncio.gather(self._lane_loop(), self._pass_loop())
 
     async def _lane_loop(self):
         """A1: the recovery lane is its own task; it ticks every LANE_S whatever the full pass or the meter do."""
@@ -720,6 +720,168 @@ class HLPositionGuardian:
         if row is not None and row['status'] == 'needs_recovery':
             await self._cancel_row_legs(ex, coin, row)
             await self._write(SQL_ROW_STATUS, row['id'], 'closed')
+
+    # ------------------------------------------------------------------ full pass
+    async def _pass_loop(self):
+        while True:
+            t0 = self._clock()
+            try:
+                mode = follower_guard.guardian_mode(MODES)
+                if mode != 'off':
+                    if await self._signal_window_open():
+                        logger.info('GUARDIAN_PASS_DEFERRED_SIGNAL')
+                    else:
+                        self._next_start = await self._pass(dry=(mode != 'enforce'), start=self._next_start,
+                                                            deadline=t0 + PASS_S)
+            except Exception as e:
+                await self._alarm(None, '*', 'GUARDIAN_EXCEPTION', 'critical', where='pass', error=repr(e)[:200])
+            await self._sleep(max(1.0, PASS_S - (self._clock() - t0)))
+
+    async def _pass(self, dry, start, deadline):
+        """One full pass. Returns the round-robin index the next pass resumes from after GUARDIAN_BUDGET."""
+        t_start = self._clock()
+        users = await self._fetch(SQL_PASS_USERS)
+        rows = await self._fetch(SQL_PASS_ROWS)
+        by_user = {}
+        for r in rows:
+            by_user.setdefault(r['user_id'], []).append(r)
+        self._flat.gc([r['id'] for r in rows if r['status'] in ACTIVE_STATUSES])
+        order = self._pass_order(users, by_user)
+        if not order:
+            return 0
+        try:
+            await self._refresh_marks(lane=False, deadline=deadline)
+        except GuardianBudget:
+            await self._alarm(None, '*', 'GUARDIAN_BUDGET', 'critical', done=0, users=len(order))
+            return start
+        except Exception as e:
+            await self._alarm(None, '*', 'GUARDIAN_READ_FAILED', 'warning', where='pass_marks', error=repr(e)[:200])
+            return start
+        n = len(order)
+        start %= n
+        for k in range(n):
+            i = (start + k) % n
+            if k and self._clock() > deadline:
+                await self._alarm(None, '*', 'GUARDIAN_BUDGET', 'critical', done=k, users=n)
+                return i
+            try:
+                await self._pass_user(order[i], by_user.get(order[i]['user_id'], []), dry, deadline)
+            except GuardianBudget:
+                await self._alarm(None, '*', 'GUARDIAN_BUDGET', 'critical', done=k, users=n)
+                return i
+            except Exception as e:
+                await self._alarm(order[i], '*', 'GUARDIAN_EXCEPTION', 'critical', where='pass_user',
+                                  error=repr(e)[:200])
+        elapsed = self._clock() - t_start
+        if elapsed > 0.8 * PASS_S:
+            await self._alarm(None, '*', 'GUARDIAN_PASS_SLOW', 'warning', elapsed_s=int(elapsed), users=n)
+        return 0
+
+    def _pass_order(self, users, by_user):
+        """'open' rows first, then other active users, then users with a row closed in the last 60 min whose
+        legs are not yet verified clean."""
+        now = self._epoch()
+        first, second, third = [], [], []
+        for u in users:
+            rows = by_user.get(u['user_id'], [])
+            if any(r['status'] == 'open' for r in rows):
+                first.append(u)
+            elif u.get('agent_active') or any(r['status'] in ACTIVE_STATUSES for r in rows):
+                second.append(u)
+            elif any(r['status'] not in ACTIVE_STATUSES and r['id'] not in self._clean_rows
+                     and row_ts(r.get('last_fill_at')) is not None and now - row_ts(r['last_fill_at']) < RECENT_CLOSED_S
+                     for r in rows):
+                third.append(u)
+        return first + second + third
+
+    async def _pass_user(self, user, urows, dry, deadline):
+        uid = user['user_id']
+        if await self._busy(uid):
+            return await self._yield(user)
+        wallet = self._wallet(user)
+        if wallet is None:
+            return await self._alarm(user, '*', 'GUARDIAN_CANNOT_TRADE', 'critical', error='no wallet address')
+        try:
+            screen = await self._get(hl_rate.W_USER_STATE, self.info.user_state, wallet, deadline=deadline)
+            live = self._live_coins(screen)
+        except GuardianBudget:
+            raise
+        except Exception as e:
+            return await self._alarm(user, '*', 'GUARDIAN_READ_FAILED', 'warning', where='screen', error=repr(e)[:200])
+        if not live and not urows:
+            return
+        book = await self._read_book(user, wallet, lane=False, deadline=deadline)
+        if book is None:
+            return
+        raw, state = book
+        if await self._busy(uid):
+            return await self._yield(user)
+        try:
+            coins = self._live_coins(state)
+        except ValueError:
+            return await self._alarm(user, '*', 'GUARDIAN_READ_UNKNOWN', 'warning')
+        by_coin = {}
+        for r in urows:
+            by_coin.setdefault(self._coin(r), []).append(r)
+        owned = service_oids(urows) | self._retired.get(uid, set())
+        coins |= {c for c, rs in by_coin.items() if any(r['status'] in ACTIVE_STATUSES for r in rs)}
+        if isinstance(raw, list):
+            coins |= {o.get('coin') for o in raw if isinstance(o, dict) and str(o.get('oid')) in owned}
+        for coin in sorted(c for c in coins if c):
+            await self._pass_pair(user, wallet, coin, by_coin.get(coin, []), raw, state, dry, deadline)
+        if isinstance(raw, list):
+            resting = {str(o.get('oid')) for o in raw if isinstance(o, dict)}
+            for r in urows:
+                if r['status'] not in ACTIVE_STATUSES and not (
+                        {real_oid(r.get('tp_order_id')), real_oid(r.get('sl_order_id'))} & resting):
+                    self._clean_rows.add(r['id'])
+
+    async def _pass_pair(self, user, wallet, coin, pair, raw, state, dry, deadline):
+        uid = user['user_id']
+        active = [r for r in pair if r['status'] in ACTIVE_STATUSES]
+        if any(r['status'] == 'needs_recovery' for r in active):
+            return                                   # the recovery lane owns this pair (incl. its ambiguity alarm)
+        pos, legs = self._pos(state, coin), self._legs(raw, coin)
+        if pos is bg.UNKNOWN or legs is bg.UNKNOWN:
+            return await self._alarm(user, coin, 'GUARDIAN_READ_UNKNOWN', 'warning')
+        row, code = await self._select(user, wallet, coin, active, pos, lane=False, deadline=deadline)
+        if code:
+            return
+        if row is None and pos is not None:
+            return await self._rowless_position(user, coin, pos, legs)
+        if row is not None and pos is None:
+            return await self._open_row_flat(user, wallet, coin, row, deadline)
+        owned = service_oids(pair) | self._retired.get(uid, set())
+        if row is None:
+            if not any(l.oid in owned for l in legs):
+                return                               # flat, rowless, nothing of ours on the book
+            return await self._invariant(user, wallet, coin, None, None, pair, None, legs, dry, lane=False,
+                                         deadline=deadline)
+        rec = rec_from_row(row, 'mark', bg.TP_TRIGGER_LIMIT)
+        if rec is None:
+            return await self._alarm(user, coin, 'ROW_LEVELS_INVALID', 'critical', row=row['id'])
+        await self._invariant(user, wallet, coin, row, rec, pair, pos, legs, dry, lane=False, deadline=deadline)
+
+    async def _open_row_flat(self, user, wallet, coin, row, deadline):
+        """'open' row, coin flat: CONFIRM re-read, FlatTracker, no decide / cancel / UPDATE (position_monitor
+        records the close, then cancels the leftover leg); FLAT_ROW_UNRECORDED once confirmed flat > 600 s."""
+        confirmed, _, _ = await self._confirm_flat(user, wallet, coin, lane=False, deadline=deadline)
+        if not confirmed:
+            return
+        flat_s = self._flat.note_confirmed_flat(row['id'], self._epoch())
+        if flat_s > follower_guard.FLAT_ROW_UNRECORDED_S:
+            await self._alarm(user, coin, 'FLAT_ROW_UNRECORDED', 'warning', row=row['id'], flat_s=int(flat_s))
+
+    async def _rowless_position(self, user, coin, pos, legs):
+        """Positions the service did not open keep today's behaviour on HL: alarm only (critical when naked)."""
+        exit_side = 'sell' if pos.side > 0 else 'buy'
+        has_stop = any(l.side == exit_side and l.kind in bg.SL_KINDS and (l.reduce_only or l.close_position)
+                       for l in legs)
+        if has_stop:
+            await self._alarm(user, coin, 'UNTRACKED_POSITION_NO_ROW', 'warning', qty=pos.qty, side=pos.side)
+        else:
+            await self._alarm(user, coin, 'UNTRACKED_NAKED_POSITION', 'critical', qty=pos.qty, side=pos.side)
+
 
 async def start_position_guardian(db_pool):
     """Start the HL position guardian (call from main.py startup; it waits START_DELAY_S itself)."""

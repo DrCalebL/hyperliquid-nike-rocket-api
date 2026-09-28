@@ -406,3 +406,21 @@ async def test_a2_enforce_lane_brackets_after_a_false_flat(g, db, venue):
     await tick(g, 'enforce')
     assert [a[5]['trigger']['tpsl'] for a in venue.order_calls()] == ['sl', 'tp']
     assert not db.errors('GUARDIAN_ROW_AMBIGUOUS')
+
+
+async def test_a1_a_full_pass_blocked_on_the_meter_does_not_delay_the_lane(g, db, venue, creds):
+    hl_rate.charge(hl_rate.CEILING + 100, 'monitor')                          # the pass will wait on the meter
+    db.add_user(8, encrypt=creds)
+    db.add_position(user_id=8, status='open', opened_at=g.world.t - timedelta(minutes=5))
+    pass_task = asyncio.ensure_future(g._pass(dry=False, start=0, deadline=g.world.mono + pg.PASS_S))
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert not pass_task.done()                                              # blocked in acquire_background
+    row = nr_row(g, db)
+    venue.set_position(WALLET, 'ADA', 4000.0, 0.5)
+    await g._recovery_lane('shadow')                                         # runs while the pass is blocked
+    assert db.positions[row['id']]['status'] == 'closed'
+    assert not pass_task.done()
+    pass_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await pass_task
