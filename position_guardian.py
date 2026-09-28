@@ -745,6 +745,14 @@ class HLPositionGuardian:
             for a in acts:
                 await self._alarm(user, coin, 'GUARDIAN_WOULD_' + a.kind, 'info', code=a.code, level=a.level,
                                   qty=a.qty, oid=a.leg.oid if a.leg is not None else None)
+            if (isinstance(pos, bg.Pos) and any(a.kind in ('PLACE_SL', 'CLOSE') for a in acts)
+                    and not self._has_exit_stop(pos, legs)):
+                # QC voice-1: a naked service position must not be the quietest event while nothing enforces
+                await self._alarm(user, coin, 'GUARDIAN_SHADOW_SL_MISSING', 'critical', qty=pos.qty,
+                                  row=row['id'] if row is not None else None,
+                                  codes=[a.code for a in acts if a.kind in ('PLACE_SL', 'CLOSE')],
+                                  handling='GUARDIAN_MODE is not enforce: nothing re-places this SL - '
+                                           'place it on Hyperliquid now')
             return
         await self._execute(user, wallet, coin, row, pos, acts, churn, lane, since, deadline)
 
@@ -1017,12 +1025,16 @@ class HLPositionGuardian:
         if flat_s > follower_guard.FLAT_ROW_UNRECORDED_S:
             await self._alarm(user, coin, 'FLAT_ROW_UNRECORDED', 'warning', row=row['id'], flat_s=int(flat_s))
 
+    @staticmethod
+    def _has_exit_stop(pos, legs):
+        """Any exit-side stop leg (reduce-only / close-position, incl. positionTpsl rows) at any level or size."""
+        exit_side = 'sell' if pos.side > 0 else 'buy'
+        return any(l.side == exit_side and l.kind in bg.SL_KINDS and (l.reduce_only or l.close_position)
+                   for l in (legs if isinstance(legs, list) else ()))
+
     async def _rowless_position(self, user, coin, pos, legs):
         """Positions the service did not open keep today's behaviour on HL: alarm only (critical when naked)."""
-        exit_side = 'sell' if pos.side > 0 else 'buy'
-        has_stop = any(l.side == exit_side and l.kind in bg.SL_KINDS and (l.reduce_only or l.close_position)
-                       for l in legs)
-        if has_stop:
+        if self._has_exit_stop(pos, legs):
             await self._alarm(user, coin, 'UNTRACKED_POSITION_NO_ROW', 'warning', qty=pos.qty, side=pos.side)
         else:
             await self._alarm(user, coin, 'UNTRACKED_NAKED_POSITION', 'critical', qty=pos.qty, side=pos.side)

@@ -259,6 +259,32 @@ async def test_shadow_pass_makes_zero_mutations_and_logs_would(g, db, venue):
     assert not [c for c in venue.ctors if c[0] == 'Exchange']
 
 
+async def test_qc_voice1_shadow_pass_raises_a_critical_alarm_for_a_naked_rowed_position(g, db, venue, notes):
+    """QC voice-1: in shadow a service-opened, rowed position with no SL was only an info GUARDIAN_WOULD_PLACE_SL
+    row, quieter than a rowless one. It now also raises a critical, notified GUARDIAN_SHADOW_SL_MISSING
+    (deduped hourly), with zero mutations."""
+    sl, tp = bracket(venue)
+    venue.external_cancel(WALLET, sl)                                        # the customer cancelled the SL
+    open_row(g, db, sl_order_id=str(sl), tp_order_id=str(tp))
+    venue.set_position(WALLET, 'ADA', 4000.0, 0.5)
+    await run_pass(g, dry=True)
+    g.world.advance(pg.PASS_S)
+    await run_pass(g, dry=True)
+    assert mutations(venue) == []
+    assert db.errors('GUARDIAN_SHADOW_SL_MISSING')
+    assert [t for t, lvl, _ in notes if t == 'GUARDIAN_SHADOW_SL_MISSING (HL)' and lvl == 'error'] == [
+        'GUARDIAN_SHADOW_SL_MISSING (HL)']
+
+
+async def test_qc_voice1_a_shadow_sl_at_a_moved_level_is_not_reported_missing(g, db, venue, notes):
+    venue.add_order(WALLET, 'ADA', 'A', 4000, 0.44, 'Stop Market')          # an SL rests, away from the row level
+    tp = venue.add_order(WALLET, 'ADA', 'A', 4000, 0.55, 'Take Profit Limit')
+    open_row(g, db, sl_order_id='111', tp_order_id=str(tp))
+    venue.set_position(WALLET, 'ADA', 4000.0, 0.5)
+    await run_pass(g, dry=True)
+    assert db.errors('GUARDIAN_WOULD_PLACE_SL') and not db.errors('GUARDIAN_SHADOW_SL_MISSING')
+
+
 async def test_enforce_builds_one_exchange_per_user_with_cached_meta_and_meters_everything(g, db, venue):
     sl, tp = bracket(venue)
     venue.external_cancel(WALLET, sl)
