@@ -32,6 +32,8 @@ Author: Nike Rocket Team
 """
 
 import asyncio
+import functools
+import inspect
 import logging
 import math
 import json
@@ -46,11 +48,16 @@ from hyperliquid.utils import constants
 from eth_account import Account
 from cryptography.fernet import Fernet
 
+import follower_guard
+import hl_rate
 from order_utils import (
     place_entry_order_with_retry,
     place_tp_order_with_retry,
     place_sl_order_with_retry,
     cancel_order_with_retry,
+    cancel_order_verified,
+    first_status,
+    notify_admin,
     notify_entry_failed,
     notify_bracket_incomplete,
     notify_signal_invalid,
@@ -85,6 +92,8 @@ DEFAULT_RISK_PERCENTAGE = 0.02  # 2% default, signal can override
 POLL_INTERVAL_SECONDS = 10
 SLIPPAGE_BPS = int(os.getenv("SLIPPAGE_BPS", "50"))  # 50 basis points = 0.5%
 USE_TESTNET = os.getenv("USE_TESTNET", "false").lower() == "true"
+GUARDIAN_MODES = ('off', 'shadow', 'enforce')    # HL follower GUARDIAN_MODE values (follower_guard.guardian_mode)
+CLOSE_LADDER = (0.02, 0.05, 0.10)                 # C41: reduce-only IOC slippage ladder, fresh all_mids each attempt
 
 
 def convert_symbol_to_hl(api_symbol: str) -> str:
@@ -102,6 +111,82 @@ def convert_symbol_to_hl(api_symbol: str) -> str:
     base = api_symbol.upper()
     base = base.replace('PF_', '').replace('USD', '').replace('USDT', '')
     return base
+
+
+def coin_szi(state, coin: str) -> float:
+    """Signed position size of `coin` in an HL user_state (0.0 when flat). ValueError on an unrecognised shape."""
+    if not isinstance(state, dict) or not isinstance(state.get('assetPositions'), list):
+        raise ValueError('unrecognised user_state shape')
+    for p in state['assetPositions']:
+        pos = (p or {}).get('position') or {}
+        if pos.get('coin') == coin:
+            szi = float(pos.get('szi') or 0)
+            if szi != 0:
+                return szi
+    return 0.0
+
+
+def coin_entry_px(state, coin: str) -> Optional[float]:
+    """entryPx of the open `coin` position in an HL user_state, or None."""
+    try:
+        for p in state.get('assetPositions') or []:
+            pos = (p or {}).get('position') or {}
+            if pos.get('coin') == coin and float(pos.get('szi') or 0) != 0:
+                px = float(pos.get('entryPx') or 0)
+                return px if px > 0 else None
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return None
+
+
+async def hl_close_with_verification(exchange, info, wallet, coin, is_buy_to_close, qty, round_price,
+                                     source='trading', executor=None):
+    """
+    C41: reduce-only IOC close ladder (2% / 5% / 10% off a fresh all_mids each attempt, 1 s then 2 s apart).
+    An attempt succeeds only when the envelope is 'ok' AND statuses[0] contains 'filled' (HL answers 'ok' for
+    an unfilled IOC). A final user_state re-read with any remaining szi makes the close a failure
+    (EMERGENCY_CLOSE_FAILED, critical). `source` labels the hl_rate charges (charges never wait); `executor`
+    runs the SDK calls (the guardian's pool; the default executor when None). Returns (ok, close_oid).
+    """
+    loop = asyncio.get_running_loop()
+    ok, close_oid = False, None
+    for i, slip in enumerate(CLOSE_LADDER):
+        if i:
+            await asyncio.sleep(i)
+        try:
+            hl_rate.charge(hl_rate.W_ALL_MIDS, source)
+            mids = await loop.run_in_executor(executor, info.all_mids)
+            mid = float((mids or {}).get(coin) or 0)
+            if mid <= 0:
+                logger.critical(f"   ❌ EMERGENCY CLOSE attempt {i + 1}: no mid price for {coin}")
+                continue
+            px = round_price(mid * (1 + slip) if is_buy_to_close else mid * (1 - slip))
+            hl_rate.charge(hl_rate.W_ACTION, source)
+            result = await loop.run_in_executor(executor, functools.partial(
+                exchange.order, coin, is_buy_to_close, qty, px, {"limit": {"tif": "Ioc"}}, True))
+            st = first_status(result)
+            if (result or {}).get('status') == 'ok' and isinstance(st, dict) and 'filled' in st:
+                ok, close_oid = True, (st.get('filled') or {}).get('oid')
+                break
+            logger.critical(f"   ❌ EMERGENCY CLOSE attempt {i + 1} ({slip:.0%}) not filled: {str(result)[:200]}")
+        except Exception as e:
+            logger.critical(f"   ❌ EMERGENCY CLOSE attempt {i + 1} ({slip:.0%}) raised: {e}")
+    try:
+        hl_rate.charge(hl_rate.W_USER_STATE, source)
+        state = await loop.run_in_executor(executor, info.user_state, wallet)
+        if coin_szi(state, coin) != 0:
+            ok = False
+    except Exception as e:
+        logger.critical(f"   ❌ EMERGENCY CLOSE re-read failed for {coin}: {e}")
+        ok = False
+    if not ok:
+        logger.critical(f"   🚨 EMERGENCY_CLOSE_FAILED {coin}: the position may still be open")
+        await notify_admin(
+            title="EMERGENCY_CLOSE_FAILED (HL)",
+            details={"Wallet": str(wallet)[:12] + "...", "Coin": coin, "Quantity": qty, "Source": source,
+                     "Action Required": "Check the account; needs_recovery rows are retried by the guardian"},
+            level="error")
+    return ok, close_oid
 
 
 class HostedTradingLoop:
@@ -599,65 +684,36 @@ class HostedTradingLoop:
     
     async def _emergency_close_position(
         self, exchange, info, wallet_address, coin, is_buy_to_close, quantity,
-        user_email, user_api_key, entry_order_id, reason
-    ):
+        user_email, user_api_key, entry_order_id, reason, sl_placed=False
+    ) -> bool:
         """
-        Emergency market close when TP/SL placement fails.
-        Protects users from unprotected positions.
+        Emergency reduce-only close when a bracket leg cannot be placed.
+        C41: verified by an IOC 'filled' status AND a flat user_state re-read (hl_close_with_verification).
+        Returns True only when the coin is verified flat; the caller records needs_recovery otherwise.
         """
         self.logger.critical(f"   🚨🚨🚨 EMERGENCY CLOSE TRIGGERED 🚨🚨🚨")
         self.logger.critical(f"   Reason: {reason}")
-        
-        close_success = False
-        close_order_id = None
-        
-        try:
-            # Get current price for IOC limit
-            # Use a wide slippage for emergency (2%)
-            state = info.user_state(wallet_address)
-            # Get mid price from meta
-            all_mids = info.all_mids()
-            mid_price = float(all_mids.get(coin, 0))
-            
-            if mid_price > 0:
-                emergency_slippage = 0.02  # 2% for emergency
-                if is_buy_to_close:
-                    limit_px = self.round_price(mid_price * (1 + emergency_slippage))
-                else:
-                    limit_px = self.round_price(mid_price * (1 - emergency_slippage))
-                
-                close_result = exchange.order(
-                    coin, is_buy_to_close, quantity, limit_px,
-                    {"limit": {"tif": "Ioc"}},
-                    reduce_only=True
-                )
-                
-                if close_result.get("status") == "ok":
-                    close_success = True
-                    statuses = close_result.get("response", {}).get("data", {}).get("statuses", [])
-                    if statuses and "filled" in statuses[0]:
-                        close_order_id = statuses[0]["filled"].get("oid")
-                    self.logger.critical(f"   ✅ EMERGENCY CLOSE SUCCESSFUL: {close_order_id}")
-                else:
-                    self.logger.critical(f"   ❌ EMERGENCY CLOSE RETURNED: {close_result}")
-            else:
-                self.logger.critical(f"   ❌ Cannot get mid price for {coin}")
-                
-        except Exception as e:
-            self.logger.critical(f"   ❌❌❌ EMERGENCY CLOSE FAILED: {e} ❌❌❌")
+
+        close_success, close_order_id = await hl_close_with_verification(
+            exchange, info, wallet_address, coin, is_buy_to_close, quantity, self.round_price, source='trading')
+        if close_success:
+            self.logger.critical(f"   ✅ EMERGENCY CLOSE VERIFIED (filled + flat): {close_order_id}")
+        else:
+            self.logger.critical(f"   ❌❌❌ EMERGENCY CLOSE FAILED ❌❌❌")
             self.logger.critical(f"   🚨 MANUAL INTERVENTION REQUIRED!")
-        
+
         await notify_bracket_incomplete(
             user_email=user_email, user_api_key=user_api_key,
             coin=coin, entry_order_id=entry_order_id,
-            tp_placed=False, sl_placed=False,
+            tp_placed=False, sl_placed=sl_placed,
             error=f"{reason} - Emergency close {'SUCCESSFUL' if close_success else 'FAILED'}"
         )
-        
+
         await log_error_to_db(self.db_pool, user_api_key, "EMERGENCY_CLOSE",
             f"{reason}. Close: {'OK' if close_success else 'FAILED'}",
             {"coin": coin, "entry_order_id": entry_order_id, "close_success": close_success})
-    
+        return close_success
+
     async def poll_and_execute(self):
         """
         Single poll cycle - check all users for signals.

@@ -82,3 +82,66 @@ async def test_unexpected_ok_statuses_stay_success_and_alarm(venue, notes, fast_
     res = await order_utils.place_sl_order_with_retry(ex, 'ADA', False, 100.0, 0.45)
     assert res['id'] == 'unknown'
     assert any('HL_UNEXPECTED_STATUS' in t for t, _, _ in notes)
+
+
+# ---------------------------------------------------------------- emergency close (C41)
+async def test_close_envelope_ok_with_inner_error_is_a_failure(venue, notes, fast_sleep):
+    venue.set_position(WALLET, 'ADA', 100.0, 0.5)
+    venue.script('order', lambda *a: fake_hl.err_status('Order could not immediately match against any resting orders.'))
+    ex, info = fake_hl.Exchange(fake_hl.Account.from_key('k'), account_address=WALLET), fake_hl.Info(skip_ws=True)
+    ok, oid = await htl.hl_close_with_verification(ex, info, WALLET, 'ADA', False, 100.0, round)
+    assert (ok, oid) == (False, None)
+    assert len(venue.order_calls()) == 3                           # the whole ladder was tried
+    assert venue.szi(WALLET, 'ADA') == 100.0
+    assert any('EMERGENCY_CLOSE_FAILED' in t for t, _, _ in notes)
+
+
+async def test_close_filled_and_flat_reread_is_success(venue, notes, fast_sleep):
+    venue.set_position(WALLET, 'ADA', -100.0, 0.5)
+    ex, info = fake_hl.Exchange(fake_hl.Account.from_key('k'), account_address=WALLET), fake_hl.Info(skip_ws=True)
+    ok, oid = await htl.hl_close_with_verification(ex, info, WALLET, 'ADA', True, 100.0, round)
+    assert ok is True and isinstance(oid, int)
+    assert venue.szi(WALLET, 'ADA') == 0.0
+    assert venue.names('info')[-1] == 'user_state'                 # verified by a re-read after the fill
+    assert not notes
+
+
+async def test_close_ladder_is_2_5_10_percent_off_a_fresh_mid_each_attempt(venue, notes, fast_sleep):
+    venue.set_position(WALLET, 'ADA', 100.0, 0.5)
+    mids = iter([0.50, 0.40, 0.30])
+    venue.script('all_mids', lambda *a: {'ADA': str(next(mids))})
+    venue.script('order', lambda *a: fake_hl.err_status('no match'), times=2)
+    ex, info = fake_hl.Exchange(fake_hl.Account.from_key('k'), account_address=WALLET), fake_hl.Info(skip_ws=True)
+    ok, _ = await htl.hl_close_with_verification(ex, info, WALLET, 'ADA', False, 100.0, lambda p: round(p, 6))
+    assert ok is True
+    assert [a[4] for a in venue.order_calls()] == [0.49, 0.38, 0.27]   # sell: mid * (1 - 2% / 5% / 10%)
+    assert all(a[6] is True and a[5] == {'limit': {'tif': 'Ioc'}} for a in venue.order_calls())
+    names = [n for t, n, _ in venue.calls if t in ('info', 'exchange')]
+    assert names[:6] == ['all_mids', 'order', 'all_mids', 'order', 'all_mids', 'order']
+    assert fast_sleep == [1, 2]
+
+
+async def test_close_filled_but_still_open_is_a_failure(venue, notes, fast_sleep):
+    venue.set_position(WALLET, 'ADA', 100.0, 0.5)
+    venue.script('order', lambda *a: fake_hl.ok_status({'filled': {'totalSz': '40', 'avgPx': '0.49', 'oid': 9}}))
+    ex, info = fake_hl.Exchange(fake_hl.Account.from_key('k'), account_address=WALLET), fake_hl.Info(skip_ws=True)
+    ok, oid = await htl.hl_close_with_verification(ex, info, WALLET, 'ADA', False, 100.0, round)
+    assert ok is False and oid == 9
+    assert any('EMERGENCY_CLOSE_FAILED' in t for t, _, _ in notes)
+
+
+async def test_close_honours_source_and_executor(venue, notes, fast_sleep):
+    venue.set_position(WALLET, 'ADA', 100.0, 0.5)
+    threads = []
+    venue.script('order', lambda *a: threads.append(threading.current_thread().name) or NotImplemented)
+    pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='guardian-test')
+    ex, info = fake_hl.Exchange(fake_hl.Account.from_key('k'), account_address=WALLET), fake_hl.Info(skip_ws=True)
+    before = hl_rate.window()[2]
+    ok, _ = await htl.hl_close_with_verification(ex, info, WALLET, 'ADA', False, 100.0, round,
+                                                 source='guardian', executor=pool)
+    pool.shutdown()
+    after = hl_rate.window()[2]
+    assert ok is True
+    assert threads and all(t.startswith('guardian-test') for t in threads)
+    assert after.get('guardian', 0) - before.get('guardian', 0) == 2 + 1 + 2   # all_mids + order + user_state
+    assert after.get('trading', 0) == before.get('trading', 0)
