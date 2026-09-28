@@ -111,3 +111,29 @@ def test_sec3_the_admin_password_is_never_printed_or_advertised():
     assert prints == []
     root = _func(tree, 'root')
     assert 'reset-database' not in ast.unparse(root) and 'password=' not in ast.unparse(root)
+
+
+# ---------------------------------------------------------------- QC security-6: test isolation
+def test_qc_security6_tests_cannot_reach_the_network():
+    import socket
+    import pytest
+    for call in (lambda: socket.create_connection(('api.resend.com', 443), timeout=1),
+                 lambda: socket.getaddrinfo('api.hyperliquid.xyz', 443)):
+        with pytest.raises(OSError, match='network blocked in tests'):
+            call()
+
+
+def test_qc_security6_production_variables_are_scrubbed():
+    for name in ('DATABASE_URL', 'RESEND_API_KEY', 'MASTER_API_KEY', 'ADMIN_PASSWORD', 'CREDENTIALS_ENCRYPTION_KEY'):
+        assert os.getenv(name) is None, name
+
+
+def test_qc_security6_run_gates_scrubs_the_child_environment():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('hl_run_gates', os.path.join(ROOT, 'tools', 'run_gates.py'))
+    gates = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(gates)
+    env = gates.gate_env({'DATABASE_URL': 'postgres://prod', 'RESEND_API_KEY': 're_live', 'MASTER_API_KEY': 'k',
+                          'ADMIN_PASSWORD': 'p', 'CREDENTIALS_ENCRYPTION_KEY': 'f', 'CHAOS_HL_TESTNET_PRIVATE_KEY': 'x',
+                          'PATH': '/bin'})
+    assert env == {'PATH': '/bin', 'PYTHONUTF8': '1'}

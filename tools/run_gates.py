@@ -13,6 +13,8 @@ There is no GitHub Actions: this command is the gate.
 5. newline-normalised sha256 of the shared files: bracket_guard.py + tests/test_bracket_guard.py against
    ../massive-rocket-algos and ../kraken-nike-rocket-api; follower_guard.py, signal_guard.py and
    tests/test_follower_common.py against ../kraken-nike-rocket-api. A missing sibling repo is a FAIL.
+The pytest child runs with gate_env(): production variables removed (QC security-6); tests/conftest.py blocks
+every non-loopback connection.
 Writes gate_logs/junit_<UTC>.xml and gate_logs/gates_<UTC>.log; prints GATES PASS|FAIL; exits 0|1.
 """
 import glob
@@ -39,6 +41,19 @@ SHARED = (('bracket_guard.py', ('massive-rocket-algos', 'kraken-nike-rocket-api'
           ('follower_guard.py', ('kraken-nike-rocket-api',)),
           ('signal_guard.py', ('kraken-nike-rocket-api',)),
           ('tests/test_follower_common.py', ('kraken-nike-rocket-api',)))
+
+
+# QC security-6: the pytest child never sees production variables (tests/conftest.py also blocks the network)
+SCRUB_ENV = ('DATABASE_URL', 'RESEND_API_KEY', 'MASTER_API_KEY', 'ADMIN_PASSWORD', 'CREDENTIALS_ENCRYPTION_KEY',
+             'GUARDIAN_MODE', 'HL_WEIGHT_CEILING', 'HL_GUARDIAN_WEIGHT_PER_MIN', 'USE_TESTNET', 'ADMIN_EMAIL',
+             'COINBASE_COMMERCE_API_KEY', 'COINBASE_COMMERCE_WEBHOOK_SECRET')
+SCRUB_PREFIXES = ('CHAOS_',)
+
+
+def gate_env(environ):
+    env = {k: v for k, v in environ.items() if k not in SCRUB_ENV and not k.startswith(SCRUB_PREFIXES)}
+    env['PYTHONUTF8'] = '1'
+    return env
 
 
 def sha256_normalised(path):
@@ -90,7 +105,8 @@ def main():
     if not missing:
         cmd = [sys.executable, '-m', 'pytest', '-q', '-rA', '-p', 'no:cacheprovider', '--junitxml', junit]
         cmd += ['tests/%s.py' % t for t in TESTS]
-        proc = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, encoding='utf-8', errors='replace')
+        proc = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, encoding='utf-8', errors='replace',
+                              env=gate_env(os.environ))
         out(proc.stdout[-4000:])
         if proc.returncode != 0:
             problems.append('pytest exit code %d' % proc.returncode)
