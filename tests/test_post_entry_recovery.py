@@ -183,6 +183,52 @@ async def test_qc_position_record_failed_note_asks_to_verify_before_adding_a_row
     assert 'verify' in details['Note'].lower() and 'before adding' in details['Note'].lower()
 
 
+def _bracket_note(notes):
+    [(title, level, details)] = [n for n in notes if 'Bracket' in n[0]]
+    return title, level, details
+
+
+async def test_qc_voice8_a_verified_flat_close_never_says_place_orders_manually(venue, db, creds, notes, fast_sleep):
+    """QC voice-8: after SL failure and a VERIFIED-flat close the e-mail said 'Position UNPROTECTED - IMMEDIATELY
+    place missing orders manually', which on HL leaves a reduce-only order resting on a flat account (dedup CHECK 2
+    then skips every later signal for that customer)."""
+    venue.script('order', reject('sl'))
+    loop = htl.HostedTradingLoop(FakePool(db))
+    assert await loop.execute_trade(make_user(db, creds), make_signal(db)) is False
+    title, level, d = _bracket_note(notes)
+    assert 'UNPROTECTED' not in d['Severity'] and 'place missing orders' not in d['Action Required']
+    assert 'do not place' in d['Action Required'].lower() and level == 'warning'
+
+
+async def test_qc_voice8_a_failed_close_points_at_the_recovery_row(venue, db, creds, notes, fast_sleep):
+    venue.script('order', reject('sl'))
+    venue.script('order', close_fails)
+    loop = htl.HostedTradingLoop(FakePool(db))
+    assert await loop.execute_trade(make_user(db, creds), make_signal(db)) is False
+    title, level, d = _bracket_note(notes)
+    assert 'UNPROTECTED' in d['Severity'] and 'needs_recovery' in d['Action Required'] and level == 'error'
+
+
+async def test_qc_voice8_tp_failure_with_the_sl_live_is_not_called_unprotected(venue, db, creds, notes, fast_sleep, monkeypatch):
+    monkeypatch.setenv('GUARDIAN_MODE', 'shadow')
+    venue.script('order', reject('tp'))
+    venue.script('order', close_fails)
+    loop = htl.HostedTradingLoop(FakePool(db))
+    assert await loop.execute_trade(make_user(db, creds), make_signal(db)) is False
+    title, level, d = _bracket_note(notes)
+    assert d['SL Placed'] == '✅ Yes' and 'UNPROTECTED' not in d['Severity']
+
+
+async def test_qc_voice11_entry_unconfirmed_mail_admits_a_missing_recovery_row(venue, db, creds, notes, fast_sleep):
+    """QC voice-11: when the needs_recovery INSERT failed, ENTRY_UNCONFIRMED no longer claims 'row written'."""
+    unconfirmed_entry(venue)
+    loop = htl.HostedTradingLoop(FakePool(db))
+    db.fail_next.append(('INSERT INTO open_positions', RuntimeError('db down')))
+    assert await loop.execute_trade(make_user(db, creds), make_signal(db)) is False
+    [(_, _, d)] = [n for n in notes if n[0] == 'ENTRY_UNCONFIRMED (HL)']
+    assert d['Handling'].startswith('NO recovery row') and 'check the account' in d['Handling']
+
+
 async def test_needs_recovery_insert_failure_notifies(venue, db, creds, notes, fast_sleep):
     unconfirmed_entry(venue)
     loop = htl.HostedTradingLoop(FakePool(db))

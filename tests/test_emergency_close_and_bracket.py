@@ -86,6 +86,21 @@ async def test_qc_voice19_an_unexpected_sl_status_also_writes_an_error_logs_row(
     assert row['context']['leg'] == 'SL'
 
 
+@pytest.mark.parametrize('mode', ['off', 'shadow', 'enforce'])
+async def test_qc_voice12_unexpected_status_handling_text_matches_the_guardian_mode(venue, notes, fast_sleep, monkeypatch, mode):
+    """QC voice-12: 'the guardian verifies the legs' was false in shadow and off."""
+    monkeypatch.setenv('GUARDIAN_MODE', mode)
+    venue.script('order', lambda *a: fake_hl.ok_status('waitingForTrigger'))
+    ex = fake_hl.Exchange(fake_hl.Account.from_key('k'), account_address=WALLET)
+    await order_utils.place_sl_order_with_retry(ex, 'ADA', False, 100.0, 0.45)
+    [(_, _, d)] = [n for n in notes if 'HL_UNEXPECTED_STATUS' in n[0]]
+    if mode == 'enforce':
+        assert 're-places a missing leg' in d['Handling']
+    else:
+        assert ('GUARDIAN_MODE=%s' % mode) in d['Handling'] and 'check the account' in d['Handling']
+        assert 'verifies' not in d['Handling']
+
+
 async def test_unexpected_ok_statuses_stay_success_and_alarm(venue, notes, fast_sleep):
     venue.script('order', lambda *a: fake_hl.ok_status('waitingForTrigger'))
     ex = fake_hl.Exchange(fake_hl.Account.from_key('k'), account_address=WALLET)

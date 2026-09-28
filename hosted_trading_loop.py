@@ -691,7 +691,7 @@ class HostedTradingLoop:
             if bracket_qty is None:
                 # No bracket is sent: HL reduce-only triggers can rest on a flat account and block dedup CHECK 2.
                 self.logger.critical(f"   🚨 ENTRY_UNCONFIRMED: no {coin} position seen - recording needs_recovery")
-                await self._record_unprotected_position(
+                recorded = await self._record_unprotected_position(
                     user, signal, coin, action.upper(), quantity, leverage, entry_order.get('id'),
                     entry_order.get('avgPx'), reason='ENTRY_UNCONFIRMED')
                 await log_error_to_db(self.db_pool, user_api_key, "ENTRY_UNCONFIRMED",
@@ -701,7 +701,10 @@ class HostedTradingLoop:
                     title="ENTRY_UNCONFIRMED (HL)",
                     details={"User": user_email, "Coin": coin, "Side": action, "Quantity": quantity,
                              "Entry Order": entry_order.get('id'),
-                             "Handling": "needs_recovery row written; the guardian recovery lane owns it"},
+                             "Handling": ("needs_recovery row written; the guardian recovery lane owns it"
+                                          if recorded else
+                                          "NO recovery row (the INSERT failed, see NEEDS_RECOVERY_RECORD_FAILED): "
+                                          "nothing will act on a fill - check the account now")},
                     level="error")
                 stage = 'done'
                 return False
@@ -937,7 +940,8 @@ class HostedTradingLoop:
 
     async def _record_unprotected_position(self, user, signal, coin, side, qty, leverage, entry_order_id,
                                            entry_fill_price, sl_order_id=None, tp_order_id=None, reason=''):
-        """R3-H1: a needs_recovery row carrying the signal levels, the qty and every known service leg id."""
+        """R3-H1: a needs_recovery row carrying the signal levels, the qty and every known service leg id.
+        True once written; False after NEEDS_RECOVERY_RECORD_FAILED (QC voice-11)."""
         try:
             async with self.db_pool.acquire() as conn:
                 sig_id = await conn.fetchval('SELECT id FROM signals WHERE signal_id = $1', signal.get('signal_id'))
@@ -949,9 +953,11 @@ class HostedTradingLoop:
                     qty, leverage, entry_fill_price, self.round_price(float(signal['take_profit'])), self.round_price(float(signal['stop_loss'])))
             await log_error_to_db(self.db_pool, user['api_key'], 'NEEDS_RECOVERY_RECORDED', reason, {'coin': coin})
             await notify_admin(title='Position recorded for guardian recovery (HL)', details={'User': user.get('email'), 'Coin': coin, 'Reason': reason}, level='error')
+            return True
         except Exception as e:
             self.logger.critical(f'   ❌ needs_recovery INSERT failed: {e}')
             await notify_admin(title='NEEDS_RECOVERY_RECORD_FAILED (HL)', details={'User': user.get('email'), 'Coin': coin, 'Reason': reason, 'Error': str(e)[:300]}, level='error')
+            return False
 
     async def _post_entry_exception(self, user, signal, post, err):
         """
@@ -1004,7 +1010,8 @@ class HostedTradingLoop:
             user_email=user_email, user_api_key=user_api_key,
             coin=coin, entry_order_id=entry_order_id,
             tp_placed=False, sl_placed=sl_placed,
-            error=f"{reason} - Emergency close {'SUCCESSFUL' if close_success else 'FAILED'}"
+            error=f"{reason} - Emergency close {'SUCCESSFUL' if close_success else 'FAILED'}",
+            close_verified=bool(close_success)
         )
 
         await log_error_to_db(self.db_pool, user_api_key, "EMERGENCY_CLOSE",

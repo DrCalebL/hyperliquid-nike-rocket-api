@@ -24,6 +24,7 @@ from datetime import datetime
 
 import aiohttp
 
+import follower_guard
 import hl_rate
 
 # Setup logging
@@ -537,6 +538,15 @@ async def cancel_order_verified(
 async def _notify_unexpected_status(kind: str, coin: str, statuses, user_email: str, user_api_key: str):
     """C43: an 'ok' envelope with unexpected statuses stays a success (raising could duplicate SLs); alarm it."""
     logger.warning(f"⚠️ HL_UNEXPECTED_STATUS {kind} {coin}: {statuses}")
+    mode = follower_guard.guardian_mode(('off', 'shadow', 'enforce'))
+    if kind == "Entry":
+        handling = "Treated as sent (id 'unknown'); execute_trade confirms the fill from user_state"
+    elif mode == "enforce":
+        handling = ("Treated as success (id 'unknown'); GUARDIAN_MODE=enforce: the guardian's next full pass "
+                    "(within about 4 min) re-places a missing leg")
+    else:
+        handling = (f"Treated as success (id 'unknown'); GUARDIAN_MODE={mode}: nothing re-places a missing leg - "
+                    f"check the account now")
     await notify_admin(
         title=f"HL_UNEXPECTED_STATUS: {kind} returned ok with unexpected statuses (HL)",
         details={
@@ -544,7 +554,7 @@ async def _notify_unexpected_status(kind: str, coin: str, statuses, user_email: 
             "API Key": user_api_key[:20] + "..." if len(user_api_key) > 20 else user_api_key,
             "Coin": coin,
             "Statuses": str(statuses)[:500],
-            "Handling": "Treated as success (id 'unknown'); the guardian verifies the legs",
+            "Handling": handling,
         },
         level="warning"
     )
@@ -590,22 +600,38 @@ async def notify_entry_failed(
 
 async def notify_bracket_incomplete(
     user_email: str, user_api_key: str, coin: str, entry_order_id: str,
-    tp_placed: bool, sl_placed: bool, error: str
+    tp_placed: bool, sl_placed: bool, error: str, close_verified: Optional[bool] = None
 ):
-    """Notify admin when TP/SL fails."""
+    """Notify admin when TP/SL fails. QC voice-8: the severity and the action follow the emergency close's outcome
+    (close_verified): after a verified-flat close nothing may be placed by hand (a reduce-only order resting on a
+    flat HL account blocks every later signal for this customer through dedup CHECK 2)."""
+    if close_verified:
+        title, level = "Bracket Order Incomplete - position closed at market (HL)", "warning"
+        severity = "RESOLVED - the position was closed at market and verified flat"
+        action = "Nothing to do - do NOT place orders manually (a resting order blocks this customer's next signals)"
+    elif close_verified is False:
+        title, level = "🚨 DANGER: Bracket Order Incomplete (HL)", "error"
+        severity = ("CRITICAL - Position open under its SL, TP missing, emergency close FAILED" if sl_placed
+                    else "CRITICAL - Position UNPROTECTED (no SL), emergency close FAILED")
+        action = ("A needs_recovery row is being written (see the NEEDS_RECOVERY e-mail); the guardian recovery lane "
+                  "acts on it within about 30 s. Check the account now")
+    else:
+        title, level = "🚨 DANGER: Bracket Order Incomplete (HL)", "error"
+        severity = "CRITICAL - Position may be UNPROTECTED" if not sl_placed else "CRITICAL - TP missing"
+        action = "Check the account on Hyperliquid now"
     await notify_admin(
-        title="🚨 DANGER: Bracket Order Incomplete (HL)",
+        title=title,
         details={
-            "Severity": "CRITICAL - Position UNPROTECTED",
+            "Severity": severity,
             "User": user_email,
             "API Key": user_api_key[:20] + "...",
             "Coin": coin, "Entry Order": entry_order_id,
             "TP Placed": "✅ Yes" if tp_placed else "❌ NO",
             "SL Placed": "✅ Yes" if sl_placed else "❌ NO",
             "Error": error[:500],
-            "Action Required": "IMMEDIATELY place missing orders manually on Hyperliquid!",
+            "Action Required": action,
         },
-        level="error"
+        level=level
     )
 
 
