@@ -145,3 +145,28 @@ async def test_close_honours_source_and_executor(venue, notes, fast_sleep):
     assert threads and all(t.startswith('guardian-test') for t in threads)
     assert after.get('guardian', 0) - before.get('guardian', 0) == 2 + 1 + 2   # all_mids + order + user_state
     assert after.get('trading', 0) == before.get('trading', 0)
+
+
+async def test_constructor_uses_cached_meta_and_charges_startup_reads(venue, db, creds, notes, caplog):
+    caplog.set_level(logging.INFO, logger='HOSTED_TRADING')
+    loop = htl.HostedTradingLoop(FakePool(db))
+    assert hl_rate.window()[2] == {'trading': 40 + 20 + 20}               # Info ctor + meta() + spot_meta()
+    assert 'HL_SDK ctor_meta=True' in caplog.text
+    before = venue.ctor_requests
+    loop.get_or_create_exchange(make_user(db, creds))
+    kind, rec = venue.ctors[-1]
+    assert kind == 'Exchange' and rec['meta'] and rec['spot_meta'] and rec['account_address'] == WALLET
+    assert venue.ctor_requests == before                                  # zero constructor requests
+    assert hl_rate.window()[2] == {'trading': 80}
+
+
+async def test_constructor_falls_back_with_a_40_charge_on_an_old_sdk(venue, db, creds, notes, monkeypatch, caplog):
+    monkeypatch.setattr(htl, 'Exchange', fake_hl.ExchangeNoMeta)
+    caplog.set_level(logging.INFO, logger='HOSTED_TRADING')
+    loop = htl.HostedTradingLoop(FakePool(db))
+    assert 'HL_SDK ctor_meta=False' in caplog.text
+    before = venue.ctor_requests
+    loop.get_or_create_exchange(make_user(db, creds))
+    assert venue.ctors[-1][1]['meta'] is False
+    assert venue.ctor_requests == before + 2
+    assert hl_rate.window()[2] == {'trading': 80 + 40}

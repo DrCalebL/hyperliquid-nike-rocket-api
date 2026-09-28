@@ -189,36 +189,69 @@ async def hl_close_with_verification(exchange, info, wallet, coin, is_buy_to_clo
     return ok, close_oid
 
 
+def exchange_ctor_takes_meta(cls=None) -> bool:
+    """R3-M3: True when the installed SDK's Exchange(...) accepts meta= and spot_meta= (its constructor then makes
+    no request). `cls` defaults to this module's Exchange (tests patch it)."""
+    try:
+        params = inspect.signature((cls or Exchange).__init__).parameters
+    except (TypeError, ValueError):
+        return False
+    return 'meta' in params and 'spot_meta' in params
+
+
 class HostedTradingLoop:
     """
     Main hosted trading loop that executes for all users on Hyperliquid.
     """
     
+    ENTRY_CONFIRM_TIMEOUT_S = 8.0   # C40.2: without totalSz, poll user_state every 1 s for up to 8 s
+    ENTRY_CONFIRM_POLL_S = 1.0
+    VERIFY_FLAT_GAP_S = 2.0         # _verified_flat: two symbol-matched user_state reads 2 s apart
+
     def __init__(self, db_pool):
         self.db_pool = db_pool
         self.active_exchanges = {}  # Cache: {api_key: (info, exchange, wallet_address)}
         self.asset_meta = {}  # Cache: {coin: {szDecimals, ...}}
         self.logger = logging.getLogger('HOSTED_TRADING')
-        
+        self._hl_meta = None        # raw meta() dict, passed as Exchange(meta=...) (R3-M3)
+        self._hl_spot_meta = None   # spot_meta() dict, passed as Exchange(spot_meta=...)
+
         # Initialize HL info client (shared, read-only)
         base_url = constants.TESTNET_API_URL if USE_TESTNET else constants.MAINNET_API_URL
+        hl_rate.charge(hl_rate.W_CTOR_UNCACHED, 'trading')   # Info(...) fetches spot_meta + meta
         self.info = Info(base_url, skip_ws=True)
         self.base_url = base_url
-        
-        # Load asset metadata for size/price rounding
+
+        # Load asset metadata for size/price rounding, and the cached constructor metadata
         self._load_asset_meta()
-    
+        self._load_spot_meta()
+        self.logger.info(f"HL_SDK ctor_meta={self._cached_ctor_meta()}")
+
     def _load_asset_meta(self):
-        """Load asset metadata for precision rounding"""
+        """Load asset metadata for precision rounding (the raw dict is kept for Exchange(meta=...))"""
         try:
+            hl_rate.charge(hl_rate.W_META, 'trading')
             meta = self.info.meta()
             if meta and 'universe' in meta:
+                self._hl_meta = meta
                 for asset in meta['universe']:
                     self.asset_meta[asset['name']] = asset
                 self.logger.info(f"📋 Loaded metadata for {len(self.asset_meta)} assets")
         except Exception as e:
             self.logger.warning(f"⚠️ Could not load asset metadata: {e}")
-    
+
+    def _load_spot_meta(self):
+        """Load spot_meta once, so Exchange(...) is built without a constructor request (R3-M3)"""
+        try:
+            hl_rate.charge(hl_rate.W_SPOT_META, 'trading')
+            self._hl_spot_meta = self.info.spot_meta()
+        except Exception as e:
+            self.logger.warning(f"⚠️ Could not load spot metadata: {e}")
+
+    def _cached_ctor_meta(self) -> bool:
+        """True when get_or_create_exchange passes cached meta= and spot_meta= (zero constructor requests)."""
+        return self._hl_meta is not None and self._hl_spot_meta is not None and exchange_ctor_takes_meta()
+
     def round_size(self, coin: str, size: float) -> float:
         """Round size to asset's szDecimals precision"""
         meta = self.asset_meta.get(coin, {})
@@ -316,11 +349,16 @@ class HostedTradingLoop:
         # Create exchange instance
         # If API wallet differs from main account, pass account_address
         # so the SDK knows to trade on behalf of the main account
+        kwargs = {}
         if wallet_address.lower() != api_wallet_address.lower():
-            exchange = Exchange(account, self.base_url, account_address=wallet_address)
+            kwargs['account_address'] = wallet_address
+        if self._cached_ctor_meta():
+            # R3-M3: cached meta + spot_meta -> the SDK constructor makes no request
+            exchange = Exchange(account, self.base_url, meta=self._hl_meta, spot_meta=self._hl_spot_meta, **kwargs)
         else:
-            exchange = Exchange(account, self.base_url)
-        
+            hl_rate.charge(hl_rate.W_CTOR_UNCACHED, 'trading')
+            exchange = Exchange(account, self.base_url, **kwargs)
+
         # Cache it
         self.active_exchanges[api_key] = (self.info, exchange, wallet_address)
         
@@ -341,6 +379,7 @@ class HostedTradingLoop:
     async def get_user_equity(self, info: Info, wallet_address: str) -> float:
         """Get user's Hyperliquid account equity"""
         try:
+            hl_rate.charge(hl_rate.W_USER_STATE, 'trading')
             state = info.user_state(wallet_address)
             if state and 'marginSummary' in state:
                 return float(state['marginSummary']['accountValue'])
