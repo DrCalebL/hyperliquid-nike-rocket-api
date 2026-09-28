@@ -587,3 +587,14 @@ async def test_ca_b8_4_unrecognised_screens_count_and_a_recognised_screen_resets
     venue.script('user_state', garbage, times=1)
     await run_pass(g)                                     # the third unrecognised screen in a row
     assert db.errors('GUARDIAN_BLIND')
+
+
+async def test_ca_b8_6_alarm_log_lines_carry_the_error_type_once(g, caplog):
+    """CA-B8-6: codes already named GUARDIAN_* are logged as-is (never GUARDIAN_GUARDIAN_*)."""
+    caplog.set_level(logging.INFO, logger='POSITION_GUARDIAN')
+    await g._alarm(None, '*', 'GUARDIAN_BUDGET', 'critical', done=0, users=1)
+    await g._alarm(None, 'ADA', 'GUARDIAN_WOULD_PLACE_SL', 'info', code='SL_REPAIRED')
+    await g._alarm(None, 'ADA', 'ROW_AMBIGUOUS', 'critical')
+    assert 'GUARDIAN_GUARDIAN_' not in caplog.text
+    for line in ('GUARDIAN_BUDGET sev=critical', 'GUARDIAN_WOULD_PLACE_SL sev=info', 'GUARDIAN_ROW_AMBIGUOUS sev=critical'):
+        assert line in caplog.text

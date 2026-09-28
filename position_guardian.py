@@ -402,13 +402,13 @@ class HLPositionGuardian:
         key = (uid, coin, code)
         fresh = now - self._alarmed.get(key, float('-inf')) >= ALARM_DEDUP_S
         level = {'critical': logging.CRITICAL, 'warning': logging.WARNING}.get(severity, logging.INFO)
-        logger.log(level, 'GUARDIAN_%s sev=%s user=%s coin=%s ctx=%s', code, severity, uid, coin, ctx)
+        error_type = code if code.startswith('GUARDIAN_') else 'GUARDIAN_' + code
+        logger.log(level, '%s sev=%s user=%s coin=%s ctx=%s', error_type, severity, uid, coin, ctx)   # CA-B8-6
         if not (fresh or code in EVENT_CODES):
             return
         if fresh:
             self._alarmed[key] = now
         details = {k: str(v)[:200] for k, v in ctx.items()}
-        error_type = code if code.startswith('GUARDIAN_') else 'GUARDIAN_' + code
         await log_error_to_db(self.db_pool, (user or {}).get('api_key') or 'system', error_type,
                               '%s (%s) coin=%s' % (code, severity, coin), dict(details, coin=coin, severity=severity))
         if (severity == 'critical' and fresh) or code in NOTIFY_CODES:
