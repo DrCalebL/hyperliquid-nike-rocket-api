@@ -36,6 +36,7 @@ from hyperliquid.exchange import Exchange
 from hyperliquid.utils import constants
 from eth_account import Account
 from cryptography.fernet import Fernet
+import hl_rate
 
 from config import (
     utc_now, to_naive_utc,
@@ -87,6 +88,7 @@ class PositionMonitor:
         
         # Shared info client
         base_url = constants.TESTNET_API_URL if USE_TESTNET else constants.MAINNET_API_URL
+        hl_rate.charge(hl_rate.W_CTOR_UNCACHED, 'monitor')
         self.info = Info(base_url, skip_ws=True)
         self.base_url = base_url
     
@@ -119,8 +121,10 @@ class PositionMonitor:
             
             # If API wallet differs from main account, pass account_address
             if wallet_address.lower() != api_wallet_address.lower():
+                hl_rate.charge(hl_rate.W_CTOR_UNCACHED, 'monitor')
                 exchange = Exchange(account, self.base_url, account_address=wallet_address)
             else:
+                hl_rate.charge(hl_rate.W_CTOR_UNCACHED, 'monitor')
                 exchange = Exchange(account, self.base_url)
             
             result = (self.info, exchange, wallet_address)
@@ -254,7 +258,9 @@ class PositionMonitor:
             info, exchange, wallet_address = result
             
             # Fetch recent fills from Hyperliquid
+            hl_rate.charge(hl_rate.W_USER_FILLS, 'monitor')
             fills = info.user_fills(wallet_address)
+            hl_rate.charge(hl_rate.extra_fill_weight(fills), 'monitor')
             
             if not fills:
                 return []
@@ -347,6 +353,7 @@ class PositionMonitor:
         - {'closed': True, 'exit_price': price, 'exit_type': 'TP'/'SL'} if closed
         """
         try:
+            hl_rate.charge(hl_rate.W_USER_STATE, 'monitor')
             state = info.user_state(wallet_address)
             
             if state and 'assetPositions' in state:
@@ -372,6 +379,7 @@ class PositionMonitor:
             # Position closed - determine exit type from open orders
             exit_type = 'UNKNOWN'
             try:
+                hl_rate.charge(hl_rate.W_OPEN_ORDERS, 'monitor')
                 open_orders = info.open_orders(wallet_address)
                 
                 tp_exists = any(str(o.get('oid', '')) == str(tp_order_id) for o in open_orders)
@@ -391,7 +399,9 @@ class PositionMonitor:
             # Get exit price from recent fills
             exit_price = None
             try:
+                hl_rate.charge(hl_rate.W_USER_FILLS, 'monitor')
                 fills = info.user_fills(wallet_address)
+                hl_rate.charge(hl_rate.extra_fill_weight(fills), 'monitor')
                 if fills:
                     # Sort by time descending
                     fills.sort(key=lambda x: x.get('time', 0), reverse=True)
@@ -421,7 +431,9 @@ class PositionMonitor:
         HL fills include 'closedPnl' field for realized P&L.
         """
         try:
+            hl_rate.charge(hl_rate.W_USER_FILLS, 'monitor')
             fills = info.user_fills(wallet_address)
+            hl_rate.charge(hl_rate.extra_fill_weight(fills), 'monitor')
             
             if not fills:
                 return None
@@ -689,6 +701,7 @@ class PositionMonitor:
             # Cancel remaining order
             try:
                 remaining_oid = position['sl_order_id'] if exit_type == 'TP' else position['tp_order_id']
+                hl_rate.charge(hl_rate.W_ACTION, 'monitor')
                 exchange.cancel(coin, int(remaining_oid))
                 self.logger.info(f"   ✅ Cancelled remaining {('SL' if exit_type == 'TP' else 'TP')} order")
             except Exception as e:
