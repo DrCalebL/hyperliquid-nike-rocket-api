@@ -87,6 +87,7 @@ async def test_sl_failure_with_a_failed_close_records_needs_recovery_without_ids
     [row] = recovery_rows(db)
     assert (row['sl_order_id'], row['tp_order_id'], row['quantity']) == (None, None, 4000.0)
     assert db.errors('NEEDS_RECOVERY_RECORDED')[0]['error_message'] == 'SL_FAILED_CLOSE_FAILED'
+    assert db.errors('EMERGENCY_CLOSE_FAILED')                                 # QC voice-19: an error_logs row too
 
 
 async def test_shadow_tp_failure_with_a_failed_close_keeps_the_sl_and_records_its_id(venue, db, creds, notes, fast_sleep, monkeypatch):
@@ -337,6 +338,32 @@ async def test_a7_intact_service_bracket_restores_the_row_instead_of_closing(g, 
     assert lane_mutations(venue) == []
     assert db.positions[row['id']]['status'] == 'open'
     assert db.errors('GUARDIAN_RECOVERY_RESTORED')
+
+
+async def test_qc_voice6_a_failing_lane_close_emails_once_per_hour_not_every_tick(g, db, venue, notes):
+    """QC voice-6: hl_close_with_verification no longer e-mails for guardian closes (the guardian's own
+    GUARDIAN_RECOVERY_CLOSE_FAILED is deduped hourly), so a stuck position is not ~120 e-mails an hour."""
+    nr_row(g, db)
+    venue.set_position(WALLET, 'ADA', 4000.0, 0.5)
+    venue.script('order', close_fails)
+    for _ in range(10):
+        await tick(g, 'shadow')
+    titles = [t for t, _, _ in notes]
+    assert 'EMERGENCY_CLOSE_FAILED (HL)' not in titles
+    assert titles.count('GUARDIAN_RECOVERY_CLOSE_FAILED (HL)') == 1
+
+
+async def test_qc_voice6_a_removed_api_wallet_stops_the_lane_close_retries(g, db, venue, notes):
+    """QC voice-6: close results go through _note_mutation_error, so 'User or API Wallet ... does not exist' stops
+    the retries for an hour (GUARDIAN_CANNOT_TRADE) instead of a close ladder every 30 s."""
+    nr_row(g, db)
+    venue.set_position(WALLET, 'ADA', 4000.0, 0.5)
+    venue.script('order', lambda a, c, b, sz, px, ot, ro: fake_hl.err_status('User or API Wallet 0xabc does not exist.')
+                 if 'limit' in ot and ro else NotImplemented)
+    for _ in range(4):
+        await tick(g, 'shadow')
+    assert len([a for a in venue.order_calls() if 'limit' in a[5] and a[6]]) == 3      # one ladder only
+    assert db.errors('GUARDIAN_CANNOT_TRADE')
 
 
 async def test_a1_saturated_meter_shadow_lane_still_closes_within_one_tick(g, db, venue, monkeypatch):

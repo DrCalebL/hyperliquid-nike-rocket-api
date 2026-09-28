@@ -146,16 +146,20 @@ def coin_entry_px(state, coin: str) -> Optional[float]:
 
 
 async def hl_close_with_verification(exchange, info, wallet, coin, is_buy_to_close, qty, round_price,
-                                     source='trading', executor=None):
+                                     source='trading', executor=None, errors=None):
     """
     C41: reduce-only IOC close ladder (2% / 5% / 10% off a fresh all_mids each attempt, 1 s then 2 s apart).
     An attempt succeeds only when the envelope is 'ok' AND statuses[0] contains 'filled' (HL answers 'ok' for
-    an unfilled IOC). A final user_state re-read with any remaining szi makes the close a failure
-    (EMERGENCY_CLOSE_FAILED, critical). `source` labels the hl_rate charges (charges never wait); `executor`
-    runs the SDK calls (the guardian's pool; the default executor when None). Returns (ok, close_oid).
+    an unfilled IOC). QC money-followers-8: a 'filled' for less than the quantity re-reads the position and the
+    ladder continues on the remainder. A final user_state re-read with any remaining szi makes the close a failure;
+    a flat re-read after any fill is a success. `source` labels the hl_rate charges (charges never wait);
+    `executor` runs the SDK calls (the guardian's pool; the default executor when None); `errors` (a list)
+    collects each failed attempt's answer (the guardian feeds them to _note_mutation_error). A failed close
+    e-mails EMERGENCY_CLOSE_FAILED (critical) only for the trading path: the guardian raises its own alarm,
+    deduped hourly (QC voice-6). Returns (ok, close_oid).
     """
     loop = asyncio.get_running_loop()
-    ok, close_oid = False, None
+    ok, close_oid, filled_any = False, None, False
     for i, slip in enumerate(CLOSE_LADDER):
         if i:
             await asyncio.sleep(i)
@@ -165,6 +169,8 @@ async def hl_close_with_verification(exchange, info, wallet, coin, is_buy_to_clo
             mid = float((mids or {}).get(coin) or 0)
             if mid <= 0:
                 logger.critical(f"   ❌ EMERGENCY CLOSE attempt {i + 1}: no mid price for {coin}")
+                if errors is not None:
+                    errors.append(f"no mid price for {coin}")
                 continue
             px = round_price(mid * (1 + slip) if is_buy_to_close else mid * (1 - slip))
             hl_rate.charge(hl_rate.W_ACTION, source)
@@ -172,26 +178,50 @@ async def hl_close_with_verification(exchange, info, wallet, coin, is_buy_to_clo
                 exchange.order, coin, is_buy_to_close, qty, px, {"limit": {"tif": "Ioc"}}, True))
             st = first_status(result)
             if (result or {}).get('status') == 'ok' and isinstance(st, dict) and 'filled' in st:
-                ok, close_oid = True, (st.get('filled') or {}).get('oid')
-                break
+                filled_any = True
+                close_oid = (st.get('filled') or {}).get('oid')
+                try:
+                    total = float((st.get('filled') or {}).get('totalSz'))
+                except (TypeError, ValueError):
+                    total = None
+                if total is None or total >= qty - 1e-9:
+                    ok = True
+                    break
+                hl_rate.charge(hl_rate.W_USER_STATE, source)
+                state = await loop.run_in_executor(executor, info.user_state, wallet)
+                left = abs(coin_szi(state, coin))
+                logger.critical(f"   ⚠️ EMERGENCY CLOSE attempt {i + 1} ({slip:.0%}) partial: {total} of {qty}, "
+                                f"{left} left")
+                if left == 0:
+                    ok = True
+                    break
+                qty = left
+                continue
             logger.critical(f"   ❌ EMERGENCY CLOSE attempt {i + 1} ({slip:.0%}) not filled: {str(result)[:200]}")
+            if errors is not None:
+                errors.append(str(result)[:300])
         except Exception as e:
             logger.critical(f"   ❌ EMERGENCY CLOSE attempt {i + 1} ({slip:.0%}) raised: {e}")
+            if errors is not None:
+                errors.append(repr(e)[:300])
     try:
         hl_rate.charge(hl_rate.W_USER_STATE, source)
         state = await loop.run_in_executor(executor, info.user_state, wallet)
         if coin_szi(state, coin) != 0:
             ok = False
+        elif filled_any:
+            ok = True
     except Exception as e:
         logger.critical(f"   ❌ EMERGENCY CLOSE re-read failed for {coin}: {e}")
         ok = False
     if not ok:
         logger.critical(f"   🚨 EMERGENCY_CLOSE_FAILED {coin}: the position may still be open")
-        await notify_admin(
-            title="EMERGENCY_CLOSE_FAILED (HL)",
-            details={"Wallet": str(wallet)[:12] + "...", "Coin": coin, "Quantity": qty, "Source": source,
-                     "Action Required": "Check the account; needs_recovery rows are retried by the guardian"},
-            level="error")
+        if source != hl_rate.GUARDIAN_SOURCE:
+            await notify_admin(
+                title="EMERGENCY_CLOSE_FAILED (HL)",
+                details={"Wallet": str(wallet)[:12] + "...", "Coin": coin, "Quantity": qty, "Source": source,
+                         "Action Required": "Check the account; needs_recovery rows are retried by the guardian"},
+                level="error")
     return ok, close_oid
 
 
@@ -650,6 +680,7 @@ class HostedTradingLoop:
                 return False
 
             stage = 'entry_sent'
+            await self._log_unexpected_status(user_api_key, 'Entry', coin, entry_order)
             post.update(info=info, exchange=exchange, wallet=wallet_address, coin=coin, side=action.upper(),
                         qty=quantity, leverage=leverage, entry_order_id=str(entry_order.get('id')),
                         entry_fill_price=entry_order.get('avgPx'), sl_oid=None, tp_oid=None)
@@ -703,6 +734,7 @@ class HostedTradingLoop:
                 return False
 
             sl_oid = str(sl_order['id'])
+            await self._log_unexpected_status(user_api_key, 'SL', coin, sl_order)
             post['sl_oid'] = sl_oid
             self.logger.info(f"   ✅ SL @ ${sl_price}: {sl_oid}")
 
@@ -717,6 +749,7 @@ class HostedTradingLoop:
 
             if tp_order:
                 post['tp_oid'] = str(tp_order['id'])
+                await self._log_unexpected_status(user_api_key, 'TP', coin, tp_order)
                 self.logger.info(f"   ✅ TP @ ${tp_price}: {tp_order['id']}")
             elif follower_guard.guardian_mode(GUARDIAN_MODES) == 'enforce':
                 # Keep the SL-protected position: the guardian re-places the TP (TP-failure-keep, enforce only)
@@ -840,6 +873,14 @@ class HostedTradingLoop:
             if stage == 'entry_sent':
                 await self._post_entry_exception(user, signal, post, e)
             return False
+
+    async def _log_unexpected_status(self, user_api_key: str, leg: str, coin: str, order: Dict):
+        """QC voice-19: an 'ok' envelope with unexpected statuses (order_utils returns id 'unknown' and e-mails
+        HL_UNEXPECTED_STATUS) also gets an error_logs row, so the weekly review finds it."""
+        if str((order or {}).get('id')) == 'unknown':
+            await log_error_to_db(self.db_pool, user_api_key, "HL_UNEXPECTED_STATUS",
+                f"{leg} returned ok with unexpected statuses; recorded with id 'unknown'",
+                {"coin": coin, "leg": leg, "raw": str((order or {}).get('raw'))[:300]})
 
     async def _live_size_above_bracket(self, info, wallet_address: str, coin: str, is_buy: bool,
                                        bracket_qty: float) -> Optional[float]:
@@ -969,6 +1010,10 @@ class HostedTradingLoop:
         await log_error_to_db(self.db_pool, user_api_key, "EMERGENCY_CLOSE",
             f"{reason}. Close: {'OK' if close_success else 'FAILED'}",
             {"coin": coin, "entry_order_id": entry_order_id, "close_success": close_success})
+        if not close_success:
+            await log_error_to_db(self.db_pool, user_api_key, "EMERGENCY_CLOSE_FAILED",
+                f"{reason}: the verified close failed; the position may still be open",
+                {"coin": coin, "entry_order_id": entry_order_id})
         return close_success
 
     async def poll_and_execute(self):

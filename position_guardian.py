@@ -542,9 +542,12 @@ class HLPositionGuardian:
         ex = await self._exchange(user, coin, lane=True)
         if ex is None:
             return
+        errors = []
         ok, close_oid = await hl_close_with_verification(ex, self.info, wallet, coin, pos.side < 0, pos.qty,
-                                                         self._round_price, source=GUARDIAN, executor=self._pool)
+                                                         self._round_price, source=GUARDIAN, executor=self._pool,
+                                                         errors=errors)
         if not ok:
+            await self._note_mutation_error(user, coin, ' | '.join(errors))       # QC voice-6
             return await self._alarm(user, coin, 'GUARDIAN_RECOVERY_CLOSE_FAILED', 'critical', row=row['id'],
                                      qty=pos.qty)
         await self._alarm(user, coin, 'GUARDIAN_RECOVERY_CLOSE', 'warning', row=row['id'], qty=pos.qty,
@@ -749,9 +752,12 @@ class HLPositionGuardian:
         """Reduce-only, flat-verified close. A needs_recovery row becomes 'closed' once its legs are cancelled
         (_close_recovery_row, CA-B8-3); an 'open' row is left to position_monitor, which records the P&L and then
         cancels the leftover leg."""
+        errors = []
         ok, close_oid = await hl_close_with_verification(ex, self.info, wallet, coin, pos.side < 0, pos.qty,
-                                                         self._round_price, source=GUARDIAN, executor=self._pool)
+                                                         self._round_price, source=GUARDIAN, executor=self._pool,
+                                                         errors=errors)
         if not ok:
+            await self._note_mutation_error(user, coin, ' | '.join(errors))       # QC voice-6
             return await self._alarm(user, coin, 'GUARDIAN_CLOSE_FAILED', 'critical', code=code, qty=pos.qty)
         await self._alarm(user, coin, 'GUARDIAN_CLOSE', 'critical', code=code, qty=pos.qty, close_oid=close_oid)
         if row is not None and row['status'] == 'needs_recovery':

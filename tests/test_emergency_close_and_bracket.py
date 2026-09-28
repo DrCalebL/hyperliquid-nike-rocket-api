@@ -77,6 +77,15 @@ async def test_cancel_order_verified_success_and_unusable_oid(venue, fast_sleep)
     assert len([c for c in venue.calls if c[1] == 'cancel']) == 1
 
 
+async def test_qc_voice19_an_unexpected_sl_status_also_writes_an_error_logs_row(venue, db, creds, notes, fast_sleep):
+    venue.script('order', lambda a, c, b, sz, px, ot, ro: fake_hl.ok_status('waitingForTrigger')
+                 if 'trigger' in ot and ot['trigger']['tpsl'] == 'sl' else NotImplemented)
+    loop = htl.HostedTradingLoop(FakePool(db))
+    assert await loop.execute_trade(make_user(db, creds), make_signal(db)) is True
+    [row] = db.errors('HL_UNEXPECTED_STATUS')
+    assert row['context']['leg'] == 'SL'
+
+
 async def test_unexpected_ok_statuses_stay_success_and_alarm(venue, notes, fast_sleep):
     venue.script('order', lambda *a: fake_hl.ok_status('waitingForTrigger'))
     ex = fake_hl.Exchange(fake_hl.Account.from_key('k'), account_address=WALLET)
@@ -129,6 +138,33 @@ async def test_close_filled_but_still_open_is_a_failure(venue, notes, fast_sleep
     ok, oid = await htl.hl_close_with_verification(ex, info, WALLET, 'ADA', False, 100.0, round)
     assert ok is False and oid == 9
     assert any('EMERGENCY_CLOSE_FAILED' in t for t, _, _ in notes)
+
+
+async def test_qc_mf8_a_partial_fill_continues_the_ladder_with_the_remainder(venue, notes, fast_sleep):
+    """QC money-followers-8: a 'filled' status for less than the quantity no longer ends the 2/5/10% ladder; the
+    wider steps run on the remaining size and a verified-flat account is a success."""
+    venue.set_position(WALLET, 'ADA', 4000.0, 0.5)
+
+    def half(account, coin, is_buy, sz, px, otype, ro):
+        venue.set_position(account, coin, 2000.0, 0.5)
+        return fake_hl.ok_status({'filled': {'totalSz': '2000', 'avgPx': str(px), 'oid': 31}})
+    venue.script('order', half, times=1)
+    ex, info = fake_hl.Exchange(fake_hl.Account.from_key('k'), account_address=WALLET), fake_hl.Info(skip_ws=True)
+    ok, oid = await htl.hl_close_with_verification(ex, info, WALLET, 'ADA', False, 4000.0, round)
+    assert ok is True and venue.szi(WALLET, 'ADA') == 0.0
+    assert [a[3] for a in venue.order_calls()] == [4000.0, 2000.0]            # the 5% step closes the remainder
+    assert not notes
+
+
+async def test_qc_voice6_guardian_closes_leave_the_failure_email_to_the_guardians_deduped_alarm(venue, notes, fast_sleep):
+    venue.set_position(WALLET, 'ADA', 100.0, 0.5)
+    venue.script('order', lambda *a: fake_hl.err_status('User or API Wallet 0xabc does not exist.'))
+    ex, info = fake_hl.Exchange(fake_hl.Account.from_key('k'), account_address=WALLET), fake_hl.Info(skip_ws=True)
+    errors = []
+    ok, _ = await htl.hl_close_with_verification(ex, info, WALLET, 'ADA', False, 100.0, round, source='guardian',
+                                                 errors=errors)
+    assert ok is False and notes == []
+    assert len(errors) == 3 and all('does not exist' in e for e in errors)
 
 
 async def test_close_honours_source_and_executor(venue, notes, fast_sleep):
