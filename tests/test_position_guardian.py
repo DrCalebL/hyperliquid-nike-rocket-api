@@ -439,6 +439,26 @@ async def test_run_starts_the_lane_and_the_pass_as_separate_loops(g, monkeypatch
     assert sorted(started) == ['lane', 'pass'] and g.world.slept == [pg.START_DELAY_S]
 
 
+async def test_qc_cov4_the_full_pass_starts_while_the_lane_loop_never_returns(g, monkeypatch):
+    """QC coverage-followers-4: run() must run the two loops concurrently; awaiting them one after the other would
+    never start the full pass (the lane loop never returns)."""
+    import asyncio
+    started = asyncio.Event()
+
+    async def lane():
+        await asyncio.Event().wait()                                         # never returns, like the real loop
+
+    async def full():
+        started.set()
+    monkeypatch.setattr(g, '_lane_loop', lane)
+    monkeypatch.setattr(g, '_pass_loop', full)
+    task = asyncio.ensure_future(g.run())
+    try:
+        await asyncio.wait_for(started.wait(), 2.0)
+    finally:
+        task.cancel()
+
+
 # ---------------------------------------------------------------- churn, crossed TP, blind reads, retired oids
 async def test_sl_removed_after_every_pass_is_replaced_3_times_then_closed(g, db, venue, notes):
     sl, tp = bracket(venue)

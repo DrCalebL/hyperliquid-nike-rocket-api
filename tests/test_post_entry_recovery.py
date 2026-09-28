@@ -647,6 +647,74 @@ async def test_qc_a_failing_marks_read_falls_back_to_cached_marks(g, db, venue):
     assert [r['status'] for r in db.positions.values()] == ['closed'] and venue.szi(WALLET, 'ADA') == 0.0
 
 
+# ---------------------------------------------------------------- QC Wave 1: coverage pins (coverage-followers-*)
+async def test_qc_cov5_a_false_flat_read_after_a_post_entry_exception_keeps_the_sl_and_writes_a_row(venue, db, creds, notes, fast_sleep, monkeypatch):
+    """QC coverage-followers-5: _verified_flat needs TWO flat reads. The TP call raises after the SL rests and the
+    next user_state read is falsely flat: the SL is kept and a needs_recovery row carries its id."""
+    raised = []
+
+    async def tp_raises(**kw):
+        raised.append(1)
+        raise RuntimeError('TP call exploded')
+    monkeypatch.setattr(htl, 'place_tp_order_with_retry', tp_raises)
+    venue.script('user_state', lambda *a: {'assetPositions': [], 'marginSummary': {'accountValue': '1'}}
+                 if raised else NotImplemented, times=1)                     # one false-empty read
+    loop = htl.HostedTradingLoop(FakePool(db))
+    assert await loop.execute_trade(make_user(db, creds), make_signal(db)) is False
+    assert venue.szi(WALLET, 'ADA') == 4000.0
+    [sl] = venue.orders(WALLET, 'ADA')                                       # never cancelled
+    [row] = recovery_rows(db)
+    assert row['sl_order_id'] == str(sl['oid'])
+    assert not [c for c in venue.calls if c[1] == 'cancel']
+
+
+async def test_qc_cov6_a_token_taken_during_the_lane_book_read_means_zero_closes(g, db, venue):
+    """QC coverage-followers-6: execute_trade starting after the lane's first busy check (here: during its
+    position read) must stop the close (the post-read re-checks)."""
+    row = nr_row(g, db)
+    venue.set_position(WALLET, 'ADA', 4000.0, 0.5)
+    toks = []
+    venue.script('user_state', lambda *a: toks.append(follower_guard.mark(7)) or NotImplemented, times=1)
+    try:
+        await tick(g, 'shadow')
+    finally:
+        for t in toks:
+            follower_guard.clear(7, t)
+    assert toks and lane_mutations(venue) == []
+    assert db.positions[row['id']]['status'] == 'needs_recovery' and venue.szi(WALLET, 'ADA') == 4000.0
+
+
+async def test_qc_cov6_a_token_taken_after_the_lane_users_recheck_still_stops_the_legacy_close(g, db, venue, monkeypatch):
+    """QC coverage-followers-6: pins _legacy_recovery's own busy check right before the market close."""
+    row = nr_row(g, db)
+    venue.set_position(WALLET, 'ADA', 4000.0, 0.5)
+    toks, real_fetch = [], g._fetch
+
+    async def fetch(sql, *args):
+        if sql == pg.SQL_USER_ROWS:
+            toks.append(follower_guard.mark(7))                              # after _lane_user's re-check
+        return await real_fetch(sql, *args)
+    monkeypatch.setattr(g, '_fetch', fetch)
+    try:
+        await tick(g, 'shadow')
+    finally:
+        for t in toks:
+            follower_guard.clear(7, t)
+    assert toks and lane_mutations(venue) == []
+    assert db.positions[row['id']]['status'] == 'needs_recovery'
+
+
+async def test_qc_cov4_a_concurrent_lane_and_enforce_pass_place_exactly_one_sl(g, db, venue, creds):
+    """QC coverage-followers-4: the full pass leaves needs_recovery pairs to the lane; run together they must
+    never place two service SLs on one position (an extra SL outlives the position and blocks dedup CHECK 2)."""
+    nr_row(g, db)
+    venue.set_position(WALLET, 'ADA', 4000.0, 0.5)
+    await asyncio.gather(g._recovery_lane('enforce'), g._pass(dry=False, start=0, deadline=g.world.mono + pg.PASS_S))
+    sls = [a for a in venue.order_calls() if 'trigger' in a[5] and a[5]['trigger']['tpsl'] == 'sl']
+    assert len(sls) == 1
+    assert len([o for o in venue.orders(WALLET, 'ADA') if o['orderType'] == 'Stop Market']) == 1
+
+
 # ---------------------------------------------------------------- coordinator amendments (CA-B8-*)
 async def test_ca_b8_3_legacy_close_with_a_failed_leg_cancel_keeps_the_row_needs_recovery(g, db, venue, notes):
     """CA-B8-3: the close is verified but the row's SL cannot be cancelled -> the row stays needs_recovery with a
