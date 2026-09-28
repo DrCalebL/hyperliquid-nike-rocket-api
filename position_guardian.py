@@ -66,6 +66,7 @@ RECENT_CLOSED_S = 3600.0
 CANNOT_TRADE_S = 3600.0
 POOL_WORKERS = 2
 BLIND_AFTER = 3
+SL_YIELDED = 'yielded'           # CA-B8-1: _place_sl's third outcome (the user went in flight between attempts)
 GUARDIAN = hl_rate.GUARDIAN_SOURCE
 EVENT_CODES = frozenset({'SL_REPAIRED', 'TP_REPAIRED', 'GUARDIAN_CLOSE', 'GUARDIAN_RECOVERY_CLOSE',
                          'GUARDIAN_RECOVERY_RESTORED', 'ROW_CLOSED_MANUAL'})
@@ -626,8 +627,9 @@ class HLPositionGuardian:
 
     async def _execute(self, user, wallet, coin, row, pos, acts, churn, lane, since=None, deadline=None):
         """Make-before-break executor: _busy re-checked before every mutation; a failed PLACE_SL closes and
-        stops the plan (the SL cancels after it never run); CLOSE ends the plan; a row is marked
-        'closed_manual' only when every cancel before it succeeded."""
+        stops the plan (the SL cancels after it never run); a PLACE_SL that yielded to execute_trade between
+        attempts stops the plan too (CA-B8-1: no CANCEL may follow a replacement SL that was not placed);
+        CLOSE ends the plan; a row is marked 'closed_manual' only when every cancel before it succeeded."""
         uid = user['user_id']
         ex, cancels_ok = None, True
         for a in acts:
@@ -645,7 +647,10 @@ class HLPositionGuardian:
                 if ex is None:
                     return
             if a.kind == 'PLACE_SL':
-                if not await self._place_sl(user, ex, coin, row, pos, a, churn, since):
+                placed = await self._place_sl(user, ex, coin, row, pos, a, churn, since)
+                if placed == SL_YIELDED:
+                    return await self._yield(user, coin)     # CA-B8-1 (I2, I16): the next tick re-decides
+                if not placed:
                     return await self._close(user, ex, wallet, coin, row, pos, 'SL_REPAIR_FAILED_CLOSED')
             elif a.kind == 'PLACE_TP':
                 await self._place_tp(user, ex, coin, row, pos, a, churn)
@@ -676,12 +681,14 @@ class HLPositionGuardian:
         return None
 
     async def _place_sl(self, user, ex, coin, row, pos, a, churn, since=None):
+        """True once an SL rests, False after SL_PLACE_ATTEMPTS failures (the caller closes), or SL_YIELDED when
+        the user went in flight between attempts (CA-B8-1: the caller stops the whole plan)."""
         uid = user['user_id']
         for attempt in range(bg.SL_PLACE_ATTEMPTS):
             if attempt:
                 await self._sleep(attempt)
                 if await self._busy(uid, since=since):
-                    return True                      # yield to execute_trade; the next tick re-decides
+                    return SL_YIELDED                # yield to execute_trade; the next tick re-decides
             oid = await self._place_leg(user, ex, coin, pos, a.level, a.qty, 'SL')
             if oid is not None:
                 churn.note_placed('SL', oid, self._epoch())

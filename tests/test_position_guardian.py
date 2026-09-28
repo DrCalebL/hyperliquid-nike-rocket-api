@@ -514,3 +514,26 @@ def test_main_registers_the_guardian_right_after_the_expiry_checker():
                    key=lambda c: c.lineno)
     started = [ast.unparse(c.args[0]) for c in calls]
     assert started.index('start_position_guardian(db_pool)') == started.index('start_expiry_checker(db_pool)') + 1
+
+
+# ---------------------------------------------------------------- coordinator amendments (CA-B8-*)
+async def test_ca_b8_1_a_yield_between_sl_attempts_stops_the_plan_before_any_cancel(g, db, venue, monkeypatch):
+    """CA-B8-1 (I2, I16): the replacement SL is rejected once, the user goes in flight before the retry and is
+    free again right after: the plan's CANCEL of the old SL must never run while no replacement SL rests."""
+    old_sl = venue.add_order(WALLET, 'ADA', 'A', 4000, 0.44, 'Stop Market')    # service SL at a wrong level
+    tp = venue.add_order(WALLET, 'ADA', 'A', 4000, 0.55, 'Take Profit Limit')
+    open_row(g, db, sl_order_id=str(old_sl), tp_order_id=str(tp))
+    venue.set_position(WALLET, 'ADA', 4000.0, 0.5)
+    venue.script('order', lambda a, c, b, sz, px, ot, ro: fake_hl.err_status('rejected')
+                 if 'trigger' in ot and ot['trigger']['tpsl'] == 'sl' else NotImplemented, times=1)
+    answers = [False, False, False, False, True]      # _pass_user x2, _invariant, _execute(PLACE_SL), SL retry
+
+    async def busy(user_id, since=None):
+        return answers.pop(0) if answers else False
+    monkeypatch.setattr(g, '_busy', busy)
+    await run_pass(g)
+    assert answers == []
+    assert not [c for c in venue.calls if c[1] == 'cancel']                    # the old SL was never cancelled
+    assert old_sl in [o['oid'] for o in venue.orders(WALLET, 'ADA')]
+    assert len([a for a in venue.order_calls() if 'trigger' in a[5]]) == 1    # no SL retry after the yield
+    assert db.errors('GUARDIAN_YIELD_INFLIGHT') and not db.errors('GUARDIAN_SL_REPAIRED')
