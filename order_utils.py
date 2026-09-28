@@ -43,6 +43,21 @@ class HLOrderRejected(Exception):
     """Hyperliquid answered and rejected the order (nothing filled): the entry may be retried as today."""
 
 
+# HTTP 4xx answers that do not prove the request was never processed (request timeout / client closed request)
+_AMBIGUOUS_4XX = (408, 499)
+
+
+def definitive_rejection(exc) -> bool:
+    """QC round 2: True when an exception from exchange.order proves nothing was accepted - HLOrderRejected, or
+    the SDK's ClientError (hyperliquid.utils.error, HTTP 4xx such as 429, raised before any matching) other than
+    the ambiguous 408 / 499. Timeouts, dropped connections, ServerError (5xx) and anything else stay unknown."""
+    if isinstance(exc, HLOrderRejected):
+        return True
+    code = getattr(exc, 'status_code', None)
+    return (type(exc).__name__ == 'ClientError' and isinstance(code, int) and not isinstance(code, bool)
+            and 400 <= code < 500 and code not in _AMBIGUOUS_4XX)
+
+
 def sl_order_type(trigger_px: float) -> Dict:
     """Stop-loss trigger dict (stop-MARKET): the entry path and the guardian send exactly this."""
     return {"trigger": {"isMarket": True, "triggerPx": trigger_px, "tpsl": "sl"}}
@@ -188,7 +203,8 @@ async def place_entry_order_with_retry(
     EXCEPTION (timeout / 5xx / dropped connection: the IOC may have filled) is NEVER re-sent, whatever a position
     read says (a read one round trip later can lag a block and show flat); {'id': 'unknown-after-exception',
     'raw': None} is returned and execute_trade confirms the fill from user_state (ENTRY_UNCONFIRMED ->
-    needs_recovery when none is seen). An HL 'error' status (rejected, nothing filled) keeps today's retry.
+    needs_recovery when none is seen). An HL 'error' status (rejected, nothing filled) keeps today's retry, and so
+    does an HTTP 4xx ClientError (QC round 2: e.g. a 429 is answered before matching; 408 / 499 stay unknown).
     """
     backoff = INITIAL_BACKOFF
     last_error = None
@@ -247,7 +263,7 @@ async def place_entry_order_with_retry(
             error_msg = str(e)[:200]
             attempts_log.append(f"Attempt {attempt}: {error_msg}")
             logger.warning(f"⚠️ Entry failed (attempt {attempt}/{MAX_RETRIES}): {error_msg}")
-            if not resend_after_exception and not isinstance(e, HLOrderRejected):
+            if not resend_after_exception and not definitive_rejection(e):
                 logger.critical("🚨 Entry raised - the IOC may have filled - NOT re-sending (double-entry guard)")
                 return {"id": "unknown-after-exception", "raw": None}
             

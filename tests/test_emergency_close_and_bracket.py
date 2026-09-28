@@ -471,3 +471,33 @@ async def test_ca_b8_5_the_entry_unexpected_status_email_never_delays_the_entry(
             break
         await asyncio.sleep(0)
     assert sent and sent[0].startswith('HL_UNEXPECTED_STATUS: Entry')
+
+
+# ---------------------------------------------------------------- QC round 2 (hl-follower): definitive 4xx retries
+class ClientError(Exception):
+    """Mirrors hyperliquid.utils.error.ClientError: raised by the SDK for an HTTP 4xx before any matching."""
+
+    def __init__(self, status_code, error_code=None, error_message='', header=None, error_data=None):
+        super().__init__(status_code, error_message)
+        self.status_code, self.error_code, self.error_message = status_code, error_code, error_message
+        self.header, self.error_data = header, error_data
+
+
+@pytest.mark.parametrize('status', [429, 400])
+async def test_qc_r2_entry_is_retried_after_a_definitive_4xx_rejection(venue, notes, fast_sleep, status):
+    """QC round 2 (order_utils): an HL 4xx (ClientError, e.g. a 429) is answered before any matching, so nothing
+    filled: the entry keeps its retry even with resend_after_exception=False."""
+    venue.script('order', lambda *a: ClientError(status, None, 'rate limited'), times=1)
+    ex = fake_hl.Exchange(fake_hl.Account.from_key('k'), account_address=WALLET)
+    res = await order_utils.place_entry_order_with_retry(ex, 'ADA', True, 100.0, 0.5, resend_after_exception=False)
+    assert res is not None and res['id'] not in ('unknown-after-exception', 'unknown') and res['totalSz'] == 100.0
+    assert len(venue.order_calls()) == 2 and venue.szi(WALLET, 'ADA') == 100.0
+
+
+@pytest.mark.parametrize('exc', [ClientError(408), ClientError(499), ConnectionError('reset'), TimeoutError('read')])
+async def test_qc_r2_ambiguous_entry_exceptions_are_still_never_resent(venue, notes, fast_sleep, exc):
+    """A timeout, a dropped connection, a 5xx or an ambiguous 408 / 499 may have filled: never re-sent."""
+    venue.script('order', lambda *a: exc, times=1)
+    ex = fake_hl.Exchange(fake_hl.Account.from_key('k'), account_address=WALLET)
+    res = await order_utils.place_entry_order_with_retry(ex, 'ADA', True, 100.0, 0.5, resend_after_exception=False)
+    assert res == {'id': 'unknown-after-exception', 'raw': None} and len(venue.order_calls()) == 1
