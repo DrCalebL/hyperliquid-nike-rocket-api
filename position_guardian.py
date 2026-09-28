@@ -19,7 +19,9 @@ RECOVERY LANE (every LANE_S=30 s, in EVERY GUARDIAN_MODE incl. 'off'; A1: its ow
   first (newest row first), then the least recently started, and starts no new user after LANE_PHASE1_S
   (warning GUARDIAN_LANE_SLOW), so a slow or hung user never starves the rest and phase 2 still runs for the users
   it read; the guardian's Info / Exchange carry
-  timeout=HL_TIMEOUT_S; a failed meta_and_asset_ctxs falls back to the cached marks, and BLIND_AFTER consecutive
+  timeout=HL_TIMEOUT_S (QC round 2: a PLACE_SL that raised - e.g. that timeout - is an unknown outcome, settled by
+  an orders re-read before any retry or close; SL_PLACE_UNKNOWN and no close while it stays unknown); a failed
+  meta_and_asset_ctxs falls back to the cached marks, and BLIND_AFTER consecutive
   failures of it raise GUARDIAN_BLIND (lane and pass alike).
 
 FULL PASS (every PASS_S=240 s; shadow = log-only 'GUARDIAN_WOULD_*', enforce = acts; 'off' = none)
@@ -62,7 +64,8 @@ from follower_guard import (ACTIVE_STATUSES, filter_actions, real_oid, rec_from_
 from hosted_trading_loop import (USE_TESTNET, coin_entry_px, coin_szi, convert_symbol_to_hl,
                                  exchange_ctor_takes_meta, floor_to_lot, hl_close_with_verification,
                                  log_error_to_db)
-from order_utils import cancel_order_verified, first_status, notify_admin, sl_order_type, tp_order_type
+from order_utils import (cancel_order_verified, definitive_rejection, first_status, notify_admin, sl_order_type,
+                         tp_order_type)
 
 logger = logging.getLogger('POSITION_GUARDIAN')
 
@@ -81,6 +84,9 @@ LANE_STALL_S = 150.0             # QC: a lane tick running longer is cut off wit
 LANE_PHASE1_S = 90.0             # QC round 2: phase 1 starts no new user after this (warning GUARDIAN_LANE_SLOW)
 MARKS_FRESH_S = 120.0            # QC: cached marks older than this never serve as the CLOSE-by-price reference
 SL_YIELDED = 'yielded'           # CA-B8-1: _place_sl's third outcome (the user went in flight between attempts)
+SL_UNKNOWN = 'unknown'           # QC round 2: a timed-out SL whose re-read failed too (may rest: never close)
+PLACE_UNKNOWN = 'place-unknown'  # QC round 2: _place_leg's outcome when ex.order raised (it may have been accepted)
+UNKNOWN_RECHECK_S = 2.0          # QC round 2: pause before the orders re-read that settles a timed-out SL
 GUARDIAN = hl_rate.GUARDIAN_SOURCE
 EVENT_CODES = frozenset({'SL_REPAIRED', 'TP_REPAIRED', 'GUARDIAN_CLOSE', 'GUARDIAN_RECOVERY_CLOSE',
                          'GUARDIAN_RECOVERY_RESTORED', 'ROW_CLOSED_MANUAL'})
@@ -778,13 +784,15 @@ class HLPositionGuardian:
                                   handling='GUARDIAN_MODE is not enforce: nothing re-places this SL - '
                                            'place it on Hyperliquid now')
             return
-        await self._execute(user, wallet, coin, row, pos, acts, churn, lane, since, deadline)
+        await self._execute(user, wallet, coin, row, pos, acts, churn, lane, since, deadline, legs=legs)
 
-    async def _execute(self, user, wallet, coin, row, pos, acts, churn, lane, since=None, deadline=None):
+    async def _execute(self, user, wallet, coin, row, pos, acts, churn, lane, since=None, deadline=None, legs=None):
         """Make-before-break executor: _busy re-checked before every mutation; a failed PLACE_SL closes and
         stops the plan (the SL cancels after it never run); a PLACE_SL that yielded to execute_trade between
         attempts stops the plan too (CA-B8-1: no CANCEL may follow a replacement SL that was not placed);
-        CLOSE ends the plan; a row is marked 'closed_manual' only when every cancel before it succeeded."""
+        CLOSE ends the plan; a row is marked 'closed_manual' only when every cancel before it succeeded.
+        QC round 2: a PLACE_SL whose outcome stays unknown (timed out, re-read failed) stops the plan WITHOUT a
+        close - an SL may rest - with a critical SL_PLACE_UNKNOWN; the next round re-decides from fresh reads."""
         uid = user['user_id']
         ex, cancels_ok = None, True
         for a in acts:
@@ -802,9 +810,13 @@ class HLPositionGuardian:
                 if ex is None:
                     return
             if a.kind == 'PLACE_SL':
-                placed = await self._place_sl(user, ex, coin, row, pos, a, churn, since)
+                placed = await self._place_sl(user, ex, coin, row, pos, a, churn, since, wallet=wallet, legs=legs)
                 if placed == SL_YIELDED:
                     return await self._yield(user, coin)     # CA-B8-1 (I2, I16): the next tick re-decides
+                if placed == SL_UNKNOWN:
+                    return await self._alarm(user, coin, 'SL_PLACE_UNKNOWN', 'critical', level=a.level, qty=a.qty,
+                                             handling='an SL may rest on Hyperliquid: not closed; re-decided '
+                                                      'from fresh reads next round')
                 if not placed:
                     return await self._close(user, ex, wallet, coin, row, pos, 'SL_REPAIR_FAILED_CLOSED')
             elif a.kind == 'PLACE_TP':
@@ -816,7 +828,9 @@ class HLPositionGuardian:
                 return await self._close(user, ex, wallet, coin, row, pos, a.code)
 
     async def _place_leg(self, user, ex, coin, pos, level, qty, leg):
-        """One PLACE_SL / PLACE_TP with the order_utils trigger dicts; success only on 'resting'. oid or None."""
+        """One PLACE_SL / PLACE_TP with the order_utils trigger dicts; success only on 'resting'. oid, None (not
+        resting / rejected), or PLACE_UNKNOWN (QC round 2: ex.order raised - a timeout or dropped connection after
+        HL accepted the order is not a rejection; only a definitive 4xx ClientError is)."""
         px = self._round_price(level)
         sz = self._round_size(coin, qty if qty is not None else pos.qty)
         order_type = sl_order_type(px) if leg == 'SL' else tp_order_type(px)
@@ -826,7 +840,7 @@ class HLPositionGuardian:
         except Exception as e:
             await self._note_mutation_error(user, coin, e)
             logger.warning('GUARDIAN %s placement raised for %s: %r', leg, coin, e)
-            return None
+            return None if definitive_rejection(e) else PLACE_UNKNOWN
         st = first_status(result)
         if (isinstance(result, dict) and result.get('status') == 'ok' and isinstance(st, dict)
                 and isinstance(st.get('resting'), dict) and st['resting'].get('oid') is not None):
@@ -835,16 +849,26 @@ class HLPositionGuardian:
         logger.warning('GUARDIAN %s placement not resting for %s: %s', leg, coin, str(result)[:200])
         return None
 
-    async def _place_sl(self, user, ex, coin, row, pos, a, churn, since=None):
-        """True once an SL rests, False after SL_PLACE_ATTEMPTS failures (the caller closes), or SL_YIELDED when
-        the user went in flight between attempts (CA-B8-1: the caller stops the whole plan)."""
+    async def _place_sl(self, user, ex, coin, row, pos, a, churn, since=None, wallet=None, legs=None):
+        """True once an SL rests, False after SL_PLACE_ATTEMPTS failures (the caller closes), SL_YIELDED when
+        the user went in flight between attempts (CA-B8-1: the caller stops the whole plan), or SL_UNKNOWN.
+        QC round 2: an attempt whose ex.order raised is settled by an orders re-read: a new exit-side stop at the
+        level (absent from the decision's book `legs`) is adopted as the placed SL; none counts as a failed
+        attempt; a failed re-read returns SL_UNKNOWN (the caller never closes while an SL may rest)."""
         uid = user['user_id']
+        known = {l.oid for l in legs} if isinstance(legs, list) else set()
         for attempt in range(bg.SL_PLACE_ATTEMPTS):
             if attempt:
                 await self._sleep(attempt)
                 if await self._busy(uid, since=since):
                     return SL_YIELDED                # yield to execute_trade; the next tick re-decides
             oid = await self._place_leg(user, ex, coin, pos, a.level, a.qty, 'SL')
+            if oid is PLACE_UNKNOWN:
+                oid = await self._find_placed_sl(user, wallet, coin, pos, a, known)
+                if oid is PLACE_UNKNOWN:
+                    return SL_UNKNOWN
+                if oid is not None:
+                    await self._alarm(user, coin, 'SL_ADOPTED_AFTER_TIMEOUT', 'warning', level=a.level, oid=oid)
             if oid is not None:
                 churn.note_placed('SL', oid, self._epoch())
                 old = real_oid(row.get('sl_order_id')) if row is not None else None
@@ -856,10 +880,38 @@ class HLPositionGuardian:
                 return True
         return False
 
+    async def _find_placed_sl(self, user, wallet, coin, pos, a, known):
+        """QC round 2: after a PLACE_SL whose ex.order raised, re-read frontend_open_orders (after
+        UNKNOWN_RECHECK_S): the oid of an exit-side reduce-only stop-market at the rounded level and size that is
+        not in `known` (the decision's book), None when there is none, PLACE_UNKNOWN when the re-read fails."""
+        if wallet is None:
+            return PLACE_UNKNOWN
+        await self._sleep(UNKNOWN_RECHECK_S)
+        try:
+            raw = await self._get(hl_rate.W_FRONTEND_OPEN_ORDERS, self.info.frontend_open_orders, wallet, lane=True)
+        except Exception as e:
+            await self._alarm(user, coin, 'GUARDIAN_READ_FAILED', 'warning', where='sl_recheck', error=repr(e)[:200])
+            return PLACE_UNKNOWN
+        if not isinstance(raw, list) or not all(isinstance(o, dict) for o in raw):
+            return PLACE_UNKNOWN
+        px = self._round_price(a.level)
+        sz = self._round_size(coin, a.qty if a.qty is not None else pos.qty)
+        tol, lot = max(self._tick(coin), abs(px) * 1e-9), self._lot(coin)
+        exit_side = 'sell' if pos.side > 0 else 'buy'
+        for l in self._legs(raw, coin):
+            if (l.oid not in known and l.side == exit_side and l.kind == bg.STOP_MARKET
+                    and (l.reduce_only or l.close_position) and l.trigger is not None
+                    and abs(l.trigger - px) <= tol and (l.qty is None or abs(l.qty - sz) < lot / 2)):
+                known.add(l.oid)
+                return l.oid
+        return None
+
     async def _place_tp(self, user, ex, coin, row, pos, a, churn):
         uid = user['user_id']
         oid = await self._place_leg(user, ex, coin, pos, a.level, a.qty, 'TP')
         now = self._epoch()
+        if oid is PLACE_UNKNOWN:
+            oid = None                               # a TP never closes: the next round re-decides from its reads
         if oid is None:
             churn.note_place_failed('TP', now)
             return await self._alarm(user, coin, 'TP_PLACE_FAILED', 'warning', level=a.level)

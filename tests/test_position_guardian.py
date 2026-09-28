@@ -678,3 +678,75 @@ async def test_ca_b8_6_alarm_log_lines_carry_the_error_type_once(g, caplog):
     assert 'GUARDIAN_GUARDIAN_' not in caplog.text
     for line in ('GUARDIAN_BUDGET sev=critical', 'GUARDIAN_WOULD_PLACE_SL sev=info', 'GUARDIAN_ROW_AMBIGUOUS sev=critical'):
         assert line in caplog.text
+
+
+# ---------------------------------------------------------------- QC round 2 (hl-follower): unknown SL outcomes
+def _missing_sl_row(g, db, venue):
+    sl, tp = bracket(venue)
+    venue.external_cancel(WALLET, sl)
+    row = open_row(g, db, sl_order_id=str(sl), tp_order_id=str(tp))
+    venue.set_position(WALLET, 'ADA', 4000.0, 0.5)
+    return row
+
+
+def _stops(venue):
+    return [o for o in venue.orders(WALLET, 'ADA') if o['orderType'] == 'Stop Market']
+
+
+async def test_qc_r2_a_slow_but_accepted_sl_is_adopted_and_never_closes(g, db, venue, notes):
+    """QC round 2: HL accepted the SL but answered after HL_TIMEOUT_S. The timeout is an unknown outcome, not a
+    rejection: the guardian re-reads the orders, adopts the resting SL and never closes the protected position
+    (it used to rest up to 3 SLs, then market-close)."""
+    row = _missing_sl_row(g, db, venue)
+
+    def accepted_then_timeout(account, coin, is_buy, sz, px, ot, ro):
+        if 'trigger' in ot:
+            venue._default_order(account, coin, is_buy, sz, px, ot, ro)
+            return TimeoutError('read timed out')
+        return NotImplemented
+    venue.script('order', accepted_then_timeout)
+    await run_pass(g)
+    [stop] = _stops(venue)
+    assert len(venue.order_calls()) == 1 and venue.szi(WALLET, 'ADA') == 4000.0
+    assert db.positions[row['id']]['sl_order_id'] == str(stop['oid'])
+    assert db.errors('GUARDIAN_SL_REPAIRED') and not db.errors('GUARDIAN_CLOSE')
+
+
+async def test_qc_r2_an_sl_timeout_with_an_unreadable_book_never_closes(g, db, venue, notes):
+    """The re-read after a timed-out SL fails too: the outcome stays unknown, so no retry and no close - a
+    critical SL_PLACE_UNKNOWN, and the next round re-decides from fresh reads."""
+    _missing_sl_row(g, db, venue)
+    timed_out = []
+
+    def timeout(account, coin, is_buy, sz, px, ot, ro):
+        if 'trigger' in ot:
+            timed_out.append(1)
+            return TimeoutError('read timed out')
+        return NotImplemented
+    venue.script('order', timeout)
+    venue.script('frontend_open_orders', lambda *a: ConnectionError('down') if timed_out else NotImplemented)
+    await run_pass(g)
+    assert len(venue.order_calls()) == 1 and venue.szi(WALLET, 'ADA') == 4000.0
+    assert db.errors('GUARDIAN_SL_PLACE_UNKNOWN') and not db.errors('GUARDIAN_CLOSE')
+    assert any(t == 'GUARDIAN_SL_PLACE_UNKNOWN (HL)' and lvl == 'error' for t, lvl, _ in notes)
+
+
+async def test_qc_r2_a_timed_out_sl_that_never_rested_is_retried(g, db, venue):
+    """A timeout whose re-read shows no new SL counts as a failed attempt: the next attempt rests normally."""
+    row = _missing_sl_row(g, db, venue)
+    venue.script('order', lambda *a: TimeoutError('read timed out') if 'trigger' in a[5] else NotImplemented, times=1)
+    await run_pass(g)
+    [stop] = _stops(venue)
+    assert len(venue.order_calls()) == 2 and venue.szi(WALLET, 'ADA') == 4000.0
+    assert db.positions[row['id']]['sl_order_id'] == str(stop['oid'])
+
+
+async def test_qc_r2_a_known_customer_stop_at_the_level_is_never_adopted(g, db, venue):
+    """Only a stop that was not in the decision's book can be the timed-out SL: a customer's half-size stop at the
+    same level is never recorded as the service SL."""
+    row = _missing_sl_row(g, db, venue)
+    customer = venue.add_order(WALLET, 'ADA', 'A', 2000, 0.45, 'Stop Market')
+    venue.script('order', lambda *a: TimeoutError('read timed out') if 'trigger' in a[5] else NotImplemented, times=1)
+    await run_pass(g)
+    assert db.positions[row['id']]['sl_order_id'] not in (str(customer), None)
+    assert venue.szi(WALLET, 'ADA') == 4000.0
