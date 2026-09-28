@@ -244,7 +244,8 @@ class HLPositionGuardian:
         self._meta, self._marks, self._szd = meta, marks, szd
 
     async def _read_book(self, user, wallet, lane, deadline=None):
-        """I1: orders FIRST, position SECOND. (raw_orders, state), or None after GUARDIAN_READ_FAILED."""
+        """I1: orders FIRST, position SECOND. (raw_orders, state), or None after GUARDIAN_READ_FAILED (a read
+        raised) or GUARDIAN_READ_UNKNOWN (an unrecognised shape, CA-B8-4); both count toward GUARDIAN_BLIND."""
         uid = user['user_id']
         try:
             raw = await self._get(hl_rate.W_FRONTEND_OPEN_ORDERS, self.info.frontend_open_orders, wallet,
@@ -253,13 +254,34 @@ class HLPositionGuardian:
         except GuardianBudget:
             raise
         except Exception as e:
-            failures = self._read_failures[uid] = self._read_failures.get(uid, 0) + 1
-            await self._alarm(user, '*', 'GUARDIAN_READ_FAILED', 'warning', error=repr(e)[:200])
-            if failures >= BLIND_AFTER:
-                await self._alarm(user, '*', 'GUARDIAN_BLIND', 'critical', failures=failures)
-            return None
+            return await self._read_failed(user, 'GUARDIAN_READ_FAILED', error=repr(e)[:200])
+        if not self._book_recognised(raw, state):
+            return await self._read_failed(user, 'GUARDIAN_READ_UNKNOWN', where='book')
         self._read_failures[uid] = 0
         return raw, state
+
+    async def _read_failed(self, user, code, **ctx):
+        """I1 (+ CA-B8-4): a read that raised (GUARDIAN_READ_FAILED) or answered with an unrecognised shape
+        (GUARDIAN_READ_UNKNOWN) means no action for the user this round, and counts: BLIND_AFTER of them in a row
+        (no recognised read in between) -> GUARDIAN_BLIND (critical). Returns None."""
+        uid = user['user_id']
+        failures = self._read_failures[uid] = self._read_failures.get(uid, 0) + 1
+        await self._alarm(user, '*', code, 'warning', **ctx)
+        if failures >= BLIND_AFTER:
+            await self._alarm(user, '*', 'GUARDIAN_BLIND', 'critical', failures=failures)
+        return None
+
+    @classmethod
+    def _book_recognised(cls, raw, state):
+        """CA-B8-4: frontend_open_orders is a list of order dicts and user_state parses (assetPositions, numeric
+        szi); anything else is UNKNOWN (I1: never act on it)."""
+        if not isinstance(raw, list) or not all(isinstance(o, dict) for o in raw):
+            return False
+        try:
+            cls._live_coins(state)
+        except (AttributeError, TypeError, ValueError):
+            return False
+        return True
 
     # ------------------------------------------------------------------ parsing / rounding
     @staticmethod
@@ -827,12 +849,16 @@ class HLPositionGuardian:
             return await self._alarm(user, '*', 'GUARDIAN_CANNOT_TRADE', 'critical', error='no wallet address')
         try:
             screen = await self._get(hl_rate.W_USER_STATE, self.info.user_state, wallet, deadline=deadline)
-            live = self._live_coins(screen)
         except GuardianBudget:
             raise
         except Exception as e:
-            return await self._alarm(user, '*', 'GUARDIAN_READ_FAILED', 'warning', where='screen', error=repr(e)[:200])
+            return await self._read_failed(user, 'GUARDIAN_READ_FAILED', where='screen', error=repr(e)[:200])
+        try:
+            live = self._live_coins(screen)
+        except (AttributeError, TypeError, ValueError):
+            return await self._read_failed(user, 'GUARDIAN_READ_UNKNOWN', where='screen')
         if not live and not self._needs_book(urows):
+            self._read_failures[uid] = 0             # CA-B8-4: a recognised screen was this user's whole read
             return
         book = await self._read_book(user, wallet, lane=False, deadline=deadline)
         if book is None:

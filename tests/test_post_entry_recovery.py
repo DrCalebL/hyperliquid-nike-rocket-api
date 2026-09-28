@@ -458,3 +458,14 @@ async def test_ca_b8_3_enforce_close_with_a_failed_leg_cancel_keeps_the_row_need
     for _ in range(10):                                                        # flat 240 s -> ORPHAN_LEG cancel
         await tick(g, 'enforce')
     assert venue.orders(WALLET) == [] and db.positions[row['id']]['status'] == 'closed_manual'
+
+
+async def test_ca_b8_4_unrecognised_position_reads_in_the_lane_count_toward_guardian_blind(g, db, venue):
+    """CA-B8-4 (I1): the lane's book reads count UNKNOWN shapes toward GUARDIAN_BLIND and never act on them."""
+    row = nr_row(g, db)
+    venue.set_position(WALLET, 'ADA', 4000.0, 0.5)
+    venue.script('user_state', lambda *a: {'unexpected': True})
+    for _ in range(3):
+        await tick(g, 'shadow')
+    assert lane_mutations(venue) == [] and db.positions[row['id']]['status'] == 'needs_recovery'
+    assert db.errors('GUARDIAN_READ_UNKNOWN') and db.errors('GUARDIAN_BLIND')

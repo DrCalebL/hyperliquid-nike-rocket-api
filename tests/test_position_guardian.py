@@ -556,3 +556,34 @@ async def test_ca_b8_2_a_recently_closed_row_gets_the_book_until_verified_clean(
     g.world.advance(pg.PASS_S)
     await run_pass(g)                                                          # verified clean by the first book
     assert [n for t, n, _ in venue.calls if t == 'info'] == ['meta_and_asset_ctxs', 'user_state']
+
+
+async def test_ca_b8_4_unrecognised_order_reads_count_toward_guardian_blind(g, db, venue, notes):
+    """CA-B8-4 (I1): a read that answers with an unrecognised shape counts toward GUARDIAN_BLIND like a raise."""
+    open_row(g, db)
+    venue.set_position(WALLET, 'ADA', 4000.0, 0.5)
+    venue.script('frontend_open_orders', lambda *a: {'error': 'unexpected'})   # an answer, but not a list
+    for _ in range(3):
+        await run_pass(g)
+        g.world.advance(pg.PASS_S)
+    assert mutations(venue) == []
+    assert db.errors('GUARDIAN_READ_UNKNOWN') and db.errors('GUARDIAN_BLIND')
+    assert any(t == 'GUARDIAN_BLIND (HL)' for t, _, _ in notes)
+
+
+async def test_ca_b8_4_unrecognised_screens_count_and_a_recognised_screen_resets(g, db, venue):
+    garbage = lambda *a: {'unexpected': True}                                  # noqa: E731
+    venue.script('user_state', garbage, times=2)          # user 7: agent_active, flat, no rows -> screen only
+    for _ in range(2):
+        await run_pass(g)
+        g.world.advance(pg.PASS_S)
+    await run_pass(g)                                     # a recognised screen was the user's whole read: reset
+    g.world.advance(pg.PASS_S)
+    venue.script('user_state', garbage, times=2)
+    for _ in range(2):
+        await run_pass(g)
+        g.world.advance(pg.PASS_S)
+    assert db.errors('GUARDIAN_READ_UNKNOWN') and not db.errors('GUARDIAN_BLIND')
+    venue.script('user_state', garbage, times=1)
+    await run_pass(g)                                     # the third unrecognised screen in a row
+    assert db.errors('GUARDIAN_BLIND')
