@@ -424,3 +424,37 @@ async def test_a1_a_full_pass_blocked_on_the_meter_does_not_delay_the_lane(g, db
     pass_task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await pass_task
+
+
+# ---------------------------------------------------------------- coordinator amendments (CA-B8-*)
+async def test_ca_b8_3_legacy_close_with_a_failed_leg_cancel_keeps_the_row_needs_recovery(g, db, venue, notes):
+    """CA-B8-3: the close is verified but the row's SL cannot be cancelled -> the row stays needs_recovery with a
+    critical alarm (never 'closed' with a service SL left on the book); the lane retries like _recovery_flat."""
+    sl = venue.add_order(WALLET, 'ADA', 'A', 4000, 0.45, 'Stop Market')
+    row = nr_row(g, db, sl_order_id=str(sl))
+    venue.set_position(WALLET, 'ADA', 4000.0, 0.5)
+    venue.script('cancel', lambda *a: ConnectionError('reset'), times=3)       # every attempt of this tick fails
+    await tick(g, 'shadow')
+    assert venue.szi(WALLET, 'ADA') == 0.0 and sl in [o['oid'] for o in venue.orders(WALLET, 'ADA')]
+    assert db.positions[row['id']]['status'] == 'needs_recovery'
+    assert db.errors('GUARDIAN_RECOVERY_CANCEL_FAILED')
+    assert any(t == 'GUARDIAN_RECOVERY_CANCEL_FAILED (HL)' and lvl == 'error' for t, lvl, _ in notes)
+    for _ in range(10):                                                        # flat 240 s -> cancel -> closed_manual
+        await tick(g, 'shadow')
+    assert venue.orders(WALLET) == [] and db.positions[row['id']]['status'] == 'closed_manual'
+
+
+async def test_ca_b8_3_enforce_close_with_a_failed_leg_cancel_keeps_the_row_needs_recovery(g, db, venue, notes):
+    tp = venue.add_order(WALLET, 'ADA', 'A', 4000, 0.55, 'Take Profit Limit')
+    row = nr_row(g, db, tp_order_id=str(tp))                                   # no SL on the book or the row
+    venue.set_position(WALLET, 'ADA', 4000.0, 0.5)
+    venue.marks['ADA'] = 0.44                                                  # long: the mark is beyond the SL
+    venue.script('cancel', lambda *a: ConnectionError('reset'), times=3)
+    await tick(g, 'enforce')                                                   # SL_MISSING_PRICE_BEYOND -> _close
+    assert venue.szi(WALLET, 'ADA') == 0.0 and db.errors('GUARDIAN_CLOSE')
+    assert tp in [o['oid'] for o in venue.orders(WALLET, 'ADA')]
+    assert db.positions[row['id']]['status'] == 'needs_recovery'
+    assert db.errors('GUARDIAN_RECOVERY_CANCEL_FAILED')
+    for _ in range(10):                                                        # flat 240 s -> ORPHAN_LEG cancel
+        await tick(g, 'enforce')
+    assert venue.orders(WALLET) == [] and db.positions[row['id']]['status'] == 'closed_manual'

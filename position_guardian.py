@@ -525,10 +525,17 @@ class HLPositionGuardian:
         if not ok:
             return await self._alarm(user, coin, 'GUARDIAN_RECOVERY_CLOSE_FAILED', 'critical', row=row['id'],
                                      qty=pos.qty)
-        await self._cancel_row_legs(ex, coin, row)
-        await self._write(SQL_ROW_STATUS, row['id'], 'closed')
         await self._alarm(user, coin, 'GUARDIAN_RECOVERY_CLOSE', 'warning', row=row['id'], qty=pos.qty,
                           close_oid=close_oid)
+        await self._close_recovery_row(user, ex, coin, row)
+
+    async def _close_recovery_row(self, user, ex, coin, row):
+        """A needs_recovery row whose position was just closed (verified flat): cancel the row's own leg ids, then
+        'closed'. CA-B8-3: a failed cancel keeps the row needs_recovery, as _recovery_flat does (the lane retries it
+        and marks it 'closed_manual' once the legs are gone), and raises a critical alarm."""
+        if not await self._cancel_row_legs(ex, coin, row):
+            return await self._alarm(user, coin, 'GUARDIAN_RECOVERY_CANCEL_FAILED', 'critical', row=row['id'])
+        await self._write(SQL_ROW_STATUS, row['id'], 'closed')
 
     async def _recovery_flat(self, user, wallet, coin, row, since):
         """needs_recovery row, coin flat: CONFIRM re-read after 5 s; 'closed_manual' (after cancelling the row's
@@ -717,16 +724,16 @@ class HLPositionGuardian:
         await self._alarm(user, coin, 'TP_REPAIRED', 'warning', level=a.level, oid=oid)
 
     async def _close(self, user, ex, wallet, coin, row, pos, code):
-        """Reduce-only, flat-verified close. A needs_recovery row becomes 'closed' (its legs cancelled); an
-        'open' row is left to position_monitor, which records the P&L and then cancels the leftover leg."""
+        """Reduce-only, flat-verified close. A needs_recovery row becomes 'closed' once its legs are cancelled
+        (_close_recovery_row, CA-B8-3); an 'open' row is left to position_monitor, which records the P&L and then
+        cancels the leftover leg."""
         ok, close_oid = await hl_close_with_verification(ex, self.info, wallet, coin, pos.side < 0, pos.qty,
                                                          self._round_price, source=GUARDIAN, executor=self._pool)
         if not ok:
             return await self._alarm(user, coin, 'GUARDIAN_CLOSE_FAILED', 'critical', code=code, qty=pos.qty)
         await self._alarm(user, coin, 'GUARDIAN_CLOSE', 'critical', code=code, qty=pos.qty, close_oid=close_oid)
         if row is not None and row['status'] == 'needs_recovery':
-            await self._cancel_row_legs(ex, coin, row)
-            await self._write(SQL_ROW_STATUS, row['id'], 'closed')
+            await self._close_recovery_row(user, ex, coin, row)
 
     # ------------------------------------------------------------------ full pass
     async def _pass_loop(self):
