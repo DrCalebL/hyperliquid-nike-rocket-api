@@ -358,11 +358,14 @@ class HostedTradingLoop:
     ) -> tuple:
         """
         SAFETY CHECK: Verify user has NO open positions or orders.
-        
+
         Returns: (has_open, reason_string)
         - (True, "reason") → SKIP trade
         - (False, None) → safe to trade
-        
+
+        Wave 1 (C42): FAIL CLOSED. A position-read error, an order-read error or any other error returns
+        (True, reason) and logs DEDUP_SKIPPED_READ_ERROR: a flaky read must never stack a second position.
+        The calls stay synchronous (trading-path concurrency unchanged); CHECK 2 (any open order) is unchanged.
         HL SDK version.
         """
         try:
@@ -372,29 +375,30 @@ class HostedTradingLoop:
                     signal_int_id = await conn.fetchval(
                         "SELECT id FROM signals WHERE signal_id = $1 LIMIT 1", signal_id
                     )
-                    
+
                     if signal_int_id:
                         existing_position = await conn.fetchval("""
-                            SELECT COUNT(*) FROM open_positions 
+                            SELECT COUNT(*) FROM open_positions
                             WHERE user_id = $1 AND signal_id = $2
                         """, user_id, int(signal_int_id))
-                        
+
                         if existing_position and existing_position > 0:
                             self.logger.warning(f"   🚫 {user_short}: Position already exists for signal")
                             return (True, "Position already exists for this signal")
-                        
+
                         recent_trade = await conn.fetchval("""
-                            SELECT COUNT(*) FROM trades 
+                            SELECT COUNT(*) FROM trades
                             WHERE user_id = $1 AND signal_id = $2::text
                             AND closed_at > NOW() - INTERVAL '60 seconds'
                         """, user_id, str(signal_int_id))
-                        
+
                         if recent_trade and recent_trade > 0:
                             self.logger.warning(f"   🚫 {user_short}: Trade recently closed for signal")
                             return (True, "Trade recently closed for this signal")
-            
+
             # ===== CHECK 1: Any open positions (any symbol) =====
             try:
+                hl_rate.charge(hl_rate.W_USER_STATE, 'trading')
                 state = info.user_state(wallet_address)
                 if state and 'assetPositions' in state:
                     for pos in state['assetPositions']:
@@ -409,9 +413,13 @@ class HostedTradingLoop:
                             return (True, f"Open position exists: {coin} {side}")
             except Exception as e:
                 self.logger.warning(f"   ⚠️ {user_short}: Error fetching positions: {e}")
-            
+                await log_error_to_db(self.db_pool, user_short, "DEDUP_SKIPPED_READ_ERROR",
+                    f"positions: {str(e)[:200]}", {"signal_id": signal_id})
+                return (True, f"Position check failed ({type(e).__name__}) - skipping to avoid stacking")
+
             # ===== CHECK 2: Any open orders =====
             try:
+                hl_rate.charge(hl_rate.W_OPEN_ORDERS, 'trading')
                 open_orders = info.open_orders(wallet_address)
                 if open_orders and len(open_orders) > 0:
                     coins_with_orders = set(o.get('coin', 'Unknown') for o in open_orders)
@@ -421,14 +429,19 @@ class HostedTradingLoop:
                     return (True, f"Open orders exist: {len(open_orders)} orders")
             except Exception as e:
                 self.logger.warning(f"   ⚠️ {user_short}: Error fetching open orders: {e}")
-            
+                await log_error_to_db(self.db_pool, user_short, "DEDUP_SKIPPED_READ_ERROR",
+                    f"open orders: {str(e)[:200]}", {"signal_id": signal_id})
+                return (True, f"Order check failed ({type(e).__name__}) - skipping to avoid stacking")
+
             return (False, None)
-            
+
         except Exception as e:
             self.logger.error(f"   ❌ {user_short}: Error in safety check: {e}")
             await log_error_to_db(self.db_pool, user_short, "SAFETY_CHECK_ERROR", str(e))
-            return (False, None)  # On error, allow trade but log
-    
+            await log_error_to_db(self.db_pool, user_short, "DEDUP_SKIPPED_READ_ERROR",
+                f"safety check: {str(e)[:200]}", {"signal_id": signal_id})
+            return (True, "Safety check error - skipping")  # fail closed: never trade on an unverified account
+
     async def execute_trade(self, user: Dict, signal: Dict) -> bool:
         """
         Execute trade for a user on Hyperliquid.
