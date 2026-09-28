@@ -160,6 +160,26 @@ async def test_open_row_insert_failure_alarms_position_record_failed(venue, db, 
     assert len(venue.orders(WALLET, 'ADA')) == 2                              # the position keeps SL + TP
 
 
+async def test_qc_billing_cycle_failure_after_the_insert_is_not_a_position_record_failure(venue, db, creds, notes, fast_sleep):
+    """QC correctness-followers-6 / money-followers-5 / voice-7 (CA-B7-2 on HL): the 'open' INSERT autocommits, so
+    a failed billing_cycle_start UPDATE must never read as a missing row or ask the operator to add one."""
+    db.fail_next.append(('billing_cycle_start', RuntimeError('connection reset')))
+    loop = htl.HostedTradingLoop(FakePool(db))
+    assert await loop.execute_trade(make_user(db, creds), make_signal(db)) is True
+    assert [r['status'] for r in db.positions.values()] == ['open']
+    assert not db.errors('POSITION_RECORD_FAILED')
+    assert db.errors('BILLING_CYCLE_START_FAILED')
+    assert not any('POSITION_RECORD_FAILED' in t for t, _, _ in notes)
+
+
+async def test_qc_position_record_failed_note_asks_to_verify_before_adding_a_row(venue, db, creds, notes, fast_sleep):
+    db.fail_next.append(('INSERT INTO open_positions', RuntimeError('db down')))
+    loop = htl.HostedTradingLoop(FakePool(db))
+    assert await loop.execute_trade(make_user(db, creds), make_signal(db)) is True
+    [(_, _, details)] = [n for n in notes if n[0] == 'POSITION_RECORD_FAILED (HL)']
+    assert 'verify' in details['Note'].lower() and 'before adding' in details['Note'].lower()
+
+
 async def test_needs_recovery_insert_failure_notifies(venue, db, creds, notes, fast_sleep):
     unconfirmed_entry(venue)
     loop = htl.HostedTradingLoop(FakePool(db))

@@ -763,13 +763,15 @@ class HostedTradingLoop:
                     level="error")
 
             # ==================== RECORD OPEN POSITION ====================
+            # QC correctness-followers-6 (CA-B7-2 on HL): the INSERT autocommits, so the billing UPDATE gets its own
+            # try - its failure must never read as a missing row (a hand-added duplicate becomes ROW_AMBIGUOUS).
+            position_opened_at = datetime.utcnow()
+            inserted = False
             try:
                 async with self.db_pool.acquire() as conn:
                     signal_db_id = await conn.fetchval(
                         "SELECT id FROM signals WHERE signal_id = $1", signal.get('signal_id')
                     )
-
-                    position_opened_at = datetime.utcnow()
 
                     await conn.execute("""
                         INSERT INTO open_positions
@@ -794,13 +796,7 @@ class HostedTradingLoop:
                         position_opened_at,
                         'open'
                     )
-
-                    # Start billing cycle if not started
-                    await conn.execute("""
-                        UPDATE follower_users SET billing_cycle_start = $2
-                        WHERE id = $1 AND billing_cycle_start IS NULL
-                    """, user['id'], position_opened_at)
-
+                    inserted = True
                     self.logger.info(f"   📝 Open position recorded in database")
             except Exception as e:
                 self.logger.error(f"   ⚠️ Failed to record position (trade still placed): {e}")
@@ -808,10 +804,26 @@ class HostedTradingLoop:
                     f"open_positions INSERT failed: {str(e)[:200]}", {"coin": coin, "sl_order_id": sl_oid})
                 await notify_admin(
                     title="POSITION_RECORD_FAILED (HL)",
-                    details={"User": user_email, "Coin": coin, "Quantity": bracket_qty, "SL Order": sl_oid,
+                    details={"User": user_email, "Coin": coin, "Quantity": row_qty, "SL Order": sl_oid,
                              "TP Order": post.get('tp_oid'), "Error": str(e)[:300],
-                             "Note": "The position keeps its SL (and TP); add the open_positions row manually"},
+                             "Note": "The position keeps its SL (and TP). Verify in open_positions that no active "
+                                     "row exists for this user and coin before adding one (a second active row "
+                                     "is ROW_AMBIGUOUS and stops the guardian repairing it)"},
                     level="error")
+
+            if inserted:
+                try:
+                    async with self.db_pool.acquire() as conn:
+                        # Start billing cycle if not started
+                        await conn.execute("""
+                            UPDATE follower_users SET billing_cycle_start = $2
+                            WHERE id = $1 AND billing_cycle_start IS NULL
+                        """, user['id'], position_opened_at)
+                except Exception as e:
+                    self.logger.error(f"   ⚠️ billing_cycle_start UPDATE failed (the position row exists): {e}")
+                    await log_error_to_db(self.db_pool, user_api_key, "BILLING_CYCLE_START_FAILED",
+                        f"billing_cycle_start UPDATE failed after the open_positions INSERT: {str(e)[:200]}",
+                        {"coin": coin, "user_id": user['id']})
             stage = 'done'
 
             self.logger.info(f"   🎉 {user_short}: Trade executed successfully!")
