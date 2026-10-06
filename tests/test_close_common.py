@@ -224,9 +224,56 @@ def test_lot_is_keyword_only():
         cg.plan_close_step(row(), pos(), 'BUY', LOT)
 
 
+# ---- QC fix (reviews 1+2 BLOCKING): a retry sizes against the row's REMAINDER, never the user's own size ----
+
+def test_retry_after_full_row_close_never_touches_user_position():
+    # venue 150 = row 100 + 50 the user added by hand. Attempt 1 closed the row's 100 (close_fill_qty 100).
+    # Attempt 2 sees venue 50: that is the user's own position -> no order, the row's share is closed.
+    step = cg.plan_close_step(row(quantity=100, close_fill_qty=100), pos(qty=50.0), 'BUY', lot=LOT)
+    assert step.code == cg.DONE_ROW_SHARE_CLOSED and step.qty is None and not step.acts
+    assert (step.venue_qty, step.row_qty, step.close_fill_qty) == (50.0, 100.0, 100.0)
+
+
+def test_retry_after_partial_fill_closes_only_the_row_remainder():
+    # 60 of the row's 100 filled (venue 150 -> 90): attempt 2 closes 40, never 90.
+    step = cg.plan_close_step(row(quantity=100, close_fill_qty=60), pos(qty=90.0), 'BUY', lot=LOT)
+    assert codes(step) == (cg.CLOSE, 40.0, 'sell') and step.residual
+    step = cg.plan_close_step(row(quantity=100, close_fill_qty='60'), pos(qty=40.0), 'BUY', lot=LOT)
+    assert codes(step) == (cg.CLOSE, 40.0, 'sell') and not step.residual
+
+
+@pytest.mark.parametrize('cf', [None, '', 0, '0', 0.0])
+def test_no_previous_fill_is_the_full_row(cf):
+    step = cg.plan_close_step(row(close_fill_qty=cf), pos(), 'BUY', lot=LOT)
+    assert codes(step) == (cg.CLOSE, 800.0, 'sell') and step.close_fill_qty == 0.0
+
+
+def test_fill_at_or_over_row_or_under_one_lot_left_is_share_closed():
+    for cf in (800, 1000, 799.5):
+        step = cg.plan_close_step(row(close_fill_qty=cf), pos(qty=300.0), 'BUY', lot=LOT)
+        assert step.code == cg.DONE_ROW_SHARE_CLOSED and not step.acts, cf
+
+
+@pytest.mark.parametrize('cf', [-1, float('nan'), float('inf'), 'abc', [1], True])
+def test_bad_close_fill_qty_fails_without_order(cf):
+    step = cg.plan_close_step(row(close_fill_qty=cf), pos(), 'BUY', lot=LOT)
+    assert step.code == cg.FAIL_BAD_QTY and not step.acts
+
+
+# ---- QC fix (review 1 #7): venue dust under one lot is effectively closed, not a failed job ----
+
+def test_venue_dust_under_one_lot_is_done_without_order():
+    step = cg.plan_close_step(row(), pos(qty=0.4), 'BUY', lot=LOT)
+    assert step.code == cg.DONE_DUST and step.qty is None and not step.acts
+    assert step.venue_qty == 0.4
+    step = cg.plan_close_step(row(quantity=0.3), bg.Pos(1, 0.05), 'BUY', lot=0.1)
+    assert step.code == cg.DONE_DUST
+
+
 def test_only_close_acts_and_step_codes_are_complete():
     assert cg.STEP_CODES == (cg.DONE_ROW_INACTIVE, cg.DEFER_RECOVERY, cg.RETRY_READ_UNKNOWN, cg.DONE_ALREADY_FLAT,
-                             cg.FAIL_SIDE_MISMATCH, cg.FAIL_BAD_QTY, cg.CLOSE)
+                             cg.FAIL_SIDE_MISMATCH, cg.FAIL_BAD_QTY, cg.DONE_ROW_SHARE_CLOSED, cg.DONE_DUST,
+                             cg.CLOSE)
     for code in cg.STEP_CODES:
         assert cg.CloseStep(code).acts == (code == cg.CLOSE)
 
@@ -242,7 +289,7 @@ def test_step_as_log_is_json_ready():
     step = cg.plan_close_step(row(), pos(qty=1000.0), 'BUY', lot=LOT)
     d = step.as_log()
     assert d == {'step': 'CLOSE', 'qty': 800.0, 'exit_side': 'sell', 'reduce_only': True, 'residual': True,
-                 'venue_qty': 1000.0, 'row_qty': 800.0, 'detail': step.detail}
+                 'venue_qty': 1000.0, 'row_qty': 800.0, 'close_fill_qty': 0.0, 'detail': step.detail}
     json.dumps(d)
 
 
@@ -293,6 +340,8 @@ def test_event_log_default_severities_and_override(tmp_path):
     assert log.emit('SOMETHING_NEW')['severity'] == 'INFO'
     assert log.emit(cg.EV_JOB_STEP, severity='nonsense')['severity'] == 'INFO'
     assert log.emit(cg.EV_JOB_STEP)['master_trade_id'] is None     # key present before the id is known
+    assert log.emit(cg.EV_RESIDUAL_NOT_OURS)['severity'] == 'WARN'
+    assert log.emit(cg.EV_DUST)['severity'] == 'WARN'
     assert set(cg.EVENT_SEVERITY) >= {'CLOSE_RECEIVED', 'CLOSE_DUPLICATE', 'CLOSE_NO_MATCH', 'CLOSE_PAYLOAD_REJECTED',
                                       'CLOSE_JOB_CREATED', 'CLOSE_JOB_STEP', 'CLOSE_JOB_OUTCOME', 'CLOSE_JOB_SKIPPED',
                                       'CLOSE_SIDE_MISMATCH', 'CLOSE_RESIDUAL', 'CLOSE_LEG_LEFT', 'CLOSE_JOB_EXPIRED',
@@ -402,3 +451,52 @@ def test_event_log_defaults_need_no_env(tmp_path, monkeypatch):
     monkeypatch.setenv('RAILWAY_GIT_COMMIT_SHA', 'deadbeef')
     log = cg.CloseEventLog(str(tmp_path / 'e2.jsonl'), venue='kraken', service='kraken-nike-rocket-api')
     assert log.emit(cg.EV_NO_MATCH)['code_sha'] == 'deadbeef'
+
+
+# ---- QC fix (review 4 #4/#9/#10): one redactor, one adversarial corpus (the same corpus is in
+# massive-rocket-algos tests/test_t1_eventlog.py), sha/tx ids and paths stay readable, config_sha in the envelope ----
+
+_S = ''.join(('Q7x', 'P2m', 'Vt9', 'Lk'))          # built at runtime: no literal secret in the source
+LEAK_TEMPLATES = (
+    'X-Master-Key: {s}', '{{"X-Master-Key": "{s}"}}', "{{'x-master-key': '{s}'}}", 'masterKey={s}',
+    'FOLLOWER_MASTER_KEY={s}', 'HL_PRIVATE_KEY = {s}', 'GET https://x.example/api?key={s}&a=1',
+    'GET https://x.example/api?apikey={s}', 'the password is {s}', 'Authorization: Bearer {s}',
+    'Authorization: Basic {s}', 'token={s}', "{{'api_secret': '{s}'}}", 'sig={s}', 'signature: {s}',
+    'auth failed: bearer {s}', 'passphrase="{s}"', 'refresh_token: {s}',
+)
+BARE_SECRETS = ('0x' + '9f' * 32, '7e' * 32, 'QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVowMTIzNDU2Nzg5Kys=',
+                'aZ3' * 12, 'Ab1_' + 'xY9z' * 9)
+KEEP = {'inputs_sha256': 'ab' * 32, 'tx_hash': '0x' + 'cd' * 32, 'code_sha': 'ef' * 32,
+        'path': 'C:/Users/loopy/massive-rocket-algos-wt-t1live/logs/close_events.jsonl',
+        'url': 'https://api.hyperliquid.xyz/info', 'master_trade_id': TID, 'wallet': '0x' + 'aB' * 20,
+        'symbol': 'ADA/USDT', 'ts': '2026-10-06T01:02:03.000Z', 'note': 'retry 3 of 6, venue qty 800.0',
+        'service': 'hyperliquid-nike-rocket-api', 'module': 'rocket_t1/vendor/rocket_bt/gpt_top100/entry_gate'}
+
+
+@pytest.mark.parametrize('tpl', LEAK_TEMPLATES)
+def test_redact_labelled_secret_inside_text(tpl):
+    out = cg.redact({'detail': tpl.format(s=_S)})['detail']
+    assert _S not in out and cg.REDACTED in out, out
+
+
+@pytest.mark.parametrize('secret', BARE_SECRETS)
+def test_redact_bare_secret_values(secret):
+    out = cg.redact({'detail': 'value %s end' % secret, 'list': [secret]})
+    assert secret not in json.dumps(out), out
+
+
+def test_redact_keeps_shas_ids_paths_and_urls():
+    assert cg.redact(KEEP) == KEEP
+    assert cg.redact({'x': {'tx_hash': '0x' + 'cd' * 32}}) == {'x': {'tx_hash': '0x' + 'cd' * 32}}
+    # outside a sha/hash-named field a bare 64-hex value is treated as a key
+    assert cg.redact({'note': 'ab' * 32}) == {'note': cg.REDACTED}
+
+
+def test_event_log_config_sha_in_envelope(tmp_path):
+    log = make_log(tmp_path, config={'CLOSE_JOBS_ENABLED': '1', 'CLOSE_SKIP_INACTIVE_USERS': '0'})
+    rec = log.emit(cg.EV_RECEIVED, master_trade_id=TID)
+    assert 'config_sha' in cg.REQUIRED_EVENT_FIELDS
+    assert isinstance(rec['config_sha'], str) and len(rec['config_sha']) == 64
+    assert rec['config_sha'] == make_log(tmp_path, config={'CLOSE_SKIP_INACTIVE_USERS': '0',
+                                                           'CLOSE_JOBS_ENABLED': '1'}).config_sha
+    assert make_log(tmp_path).emit(cg.EV_RECEIVED)['config_sha'] == 'unknown'

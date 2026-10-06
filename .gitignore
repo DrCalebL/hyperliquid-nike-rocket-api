@@ -4,3 +4,4 @@ gate_logs/
 chaos_out/
 .env
 .env.*
+logs/

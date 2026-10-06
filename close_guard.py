@@ -12,11 +12,15 @@ fixture tests/fixtures/close_v2.json), 19.6/19.7 (plan_close_step, job constants
   /api/broadcast-close calls it after verify_master_key and before any DB write.
 - plan_close_step(row, venue_pos, payload_side, *, lot) -> CloseStep: what execute_close does next for one
   open_positions row, from a fresh row read and a fresh venue read. Only CLOSE acts; every other code places no
-  order. A read error (bracket_guard.UNKNOWN or an unrecognised shape) never acts.
+  order. A read error (bracket_guard.UNKNOWN or an unrecognised shape) never acts. venue_pos None is FLAT
+  (bracket_guard's convention): callers must pass bg.UNKNOWN, never None, on a read error.
+  The close is sized against the row's REMAINDER, row.quantity - row.close_fill_qty, so a retry can never close
+  a position the user added by hand: execute_close must write close_fill_qty CUMULATIVELY after every fill.
 - CloseEventLog: structured follower close events -> logs/close_events.jsonl (+ the 'close_events' logger, which is
   what Railway keeps), redacted, size-rotated, never raises.
 """
 import datetime as _dt
+import hashlib
 import json
 import logging
 import os
@@ -47,17 +51,24 @@ CLOSE_BUSY_WINDOW_S = 180
 JOB_STATUSES = ('pending', 'deferred', 'done', 'failed', 'skipped', 'expired')
 JOB_OPEN_STATUSES = ('pending', 'deferred')
 
-# plan_close_step codes. FAIL_BAD_QTY (row quantity or lot unusable, or less than one lot to close) is the builder's
-# addition to the six codes of 19.6: like FAIL_SIDE_MISMATCH it places no order (job failed + critical alarm).
+# plan_close_step codes. Additions to the six codes of 19.6, none of which places an order:
+# - FAIL_BAD_QTY (row quantity, close_fill_qty or lot unusable, or the row is under one lot): job failed + critical.
+# - DONE_ROW_SHARE_CLOSED (QC): close_fill_qty already covers the row (under one lot left). Whatever the venue still
+#   holds is not ours (the user added it by hand): job done, alarm CLOSE_RESIDUAL_NOT_OURS (warning), then cancel
+#   the row's SL by recorded id (19.7 step 8) so it can never close the user's own position.
+# - DONE_DUST (QC): the venue holds less than one lot (e.g. after a partial TP): nothing closable; job done, alarm
+#   CLOSE_DUST (warning); the legs stay with the monitor/guardian.
 DONE_ROW_INACTIVE = 'DONE_ROW_INACTIVE'
 DEFER_RECOVERY = 'DEFER_RECOVERY'
 RETRY_READ_UNKNOWN = 'RETRY_READ_UNKNOWN'
 DONE_ALREADY_FLAT = 'DONE_ALREADY_FLAT'
 FAIL_SIDE_MISMATCH = 'FAIL_SIDE_MISMATCH'
 FAIL_BAD_QTY = 'FAIL_BAD_QTY'
+DONE_ROW_SHARE_CLOSED = 'DONE_ROW_SHARE_CLOSED'
+DONE_DUST = 'DONE_DUST'
 CLOSE = 'CLOSE'
 STEP_CODES = (DONE_ROW_INACTIVE, DEFER_RECOVERY, RETRY_READ_UNKNOWN, DONE_ALREADY_FLAT, FAIL_SIDE_MISMATCH,
-              FAIL_BAD_QTY, CLOSE)
+              FAIL_BAD_QTY, DONE_ROW_SHARE_CLOSED, DONE_DUST, CLOSE)
 
 
 def is_master_trade_id(v):
@@ -110,10 +121,11 @@ def validate_close_payload(d, known_symbols, now_ms):
 @dataclass
 class CloseStep:
     code: str
-    qty: float = None           # CLOSE only: base units, floored to the lot, <= min(venue, row)
+    qty: float = None           # CLOSE only: base units, floored to the lot, <= min(venue, row remainder)
     exit_side: str = None       # CLOSE only: 'sell' closes a long, 'buy' closes a short
     venue_qty: float = None
     row_qty: float = None
+    close_fill_qty: float = None    # what earlier attempts already closed for this row (0 when none)
     residual: bool = False      # CLOSE only: the venue holds more than qty, so the close cannot reach flat
     detail: str = ''
 
@@ -128,7 +140,7 @@ class CloseStep:
     def as_log(self):
         return {'step': self.code, 'qty': self.qty, 'exit_side': self.exit_side, 'reduce_only': self.reduce_only,
                 'residual': self.residual, 'venue_qty': self.venue_qty, 'row_qty': self.row_qty,
-                'detail': self.detail}
+                'close_fill_qty': self.close_fill_qty, 'detail': self.detail}
 
 
 def _row_get(row, key):
@@ -155,9 +167,13 @@ def plan_close_step(row, venue_pos, payload_side, *, lot):
     2. venue_pos UNKNOWN or not a valid bracket_guard.Pos -> RETRY_READ_UNKNOWN (a read error never acts);
     3. venue_pos None or qty 0 -> DONE_ALREADY_FLAT;
     4. venue side != row side, or row side != payload_side ('BUY'|'SELL') -> FAIL_SIDE_MISMATCH;
-    5. row quantity or lot unusable, or less than one lot to close -> FAIL_BAD_QTY;
-    6. CLOSE(qty = min(venue qty, row quantity) floored to lot), exit_side opposite the position, residual=True when
-       the venue holds more than qty (the caller keeps the SL and alarms CLOSE_RESIDUAL if not flat afterwards).
+    5. row quantity, close_fill_qty (None/'' = 0) or lot unusable -> FAIL_BAD_QTY;
+    6. close_fill_qty > 0 and the row remainder (quantity - close_fill_qty) is under one lot ->
+       DONE_ROW_SHARE_CLOSED (what the venue still holds is not ours);
+    7. venue qty under one lot -> DONE_DUST; row quantity under one lot -> FAIL_BAD_QTY;
+    8. CLOSE(qty = min(venue qty, row remainder) floored to lot), exit_side opposite the position, residual=True
+       when the venue holds more than qty (the caller keeps the SL and alarms CLOSE_RESIDUAL if not flat
+       afterwards; the next attempt sees the larger close_fill_qty and stops at the row's share).
     Pure: never raises on bad row or venue values, never mutates row."""
     status = _row_get(row, 'status')
     if status not in fg.ACTIVE_STATUSES:
@@ -186,21 +202,34 @@ def plan_close_step(row, venue_pos, payload_side, *, lot):
     if rq is None or lt is None:
         return CloseStep(FAIL_BAD_QTY, venue_qty=vq, row_qty=rq,
                          detail='row quantity or lot unusable (lot %r)' % (lot,))
-    dv, dr, dl = _dec(vq), _dec(rq), _dec(lt)
-    lots = (min(dv, dr) / dl).to_integral_value(rounding=ROUND_FLOOR)
+    cf_raw = _row_get(row, 'close_fill_qty')
+    cf = 0.0 if cf_raw is None or cf_raw == '' else (None if isinstance(cf_raw, bool) else bg._f(cf_raw))
+    if cf is None or cf < 0 or cf != cf or cf in (float('inf'), float('-inf')):
+        return CloseStep(FAIL_BAD_QTY, venue_qty=vq, row_qty=rq,
+                         detail='close_fill_qty unusable (%r)' % (cf_raw,))
+    dv, dr, dl, dcf = _dec(vq), _dec(rq), _dec(lt), _dec(cf)
+    remainder = dr - dcf
+    if dcf > 0 and remainder < dl:
+        return CloseStep(DONE_ROW_SHARE_CLOSED, venue_qty=vq, row_qty=rq, close_fill_qty=cf,
+                         detail='row share already closed; the venue rest is not ours')
+    if dv < dl:
+        return CloseStep(DONE_DUST, venue_qty=vq, row_qty=rq, close_fill_qty=cf,
+                         detail='venue holds less than one lot')
+    lots = (min(dv, remainder) / dl).to_integral_value(rounding=ROUND_FLOOR)
     dq = lots * dl
     if dq <= 0:
-        return CloseStep(FAIL_BAD_QTY, venue_qty=vq, row_qty=rq, detail='less than one lot to close')
+        return CloseStep(FAIL_BAD_QTY, venue_qty=vq, row_qty=rq, close_fill_qty=cf,
+                         detail='less than one lot to close')
     qty = float(dq)
     return CloseStep(CLOSE, qty=qty, exit_side='sell' if rs > 0 else 'buy', venue_qty=vq, row_qty=rq,
-                     residual=dv > dq, detail='reduce-only close')
+                     close_fill_qty=cf, residual=dv > dq, detail='reduce-only close')
 
 
 # ---- section 21: follower close event log ----
 
 LOG_PATH_DEFAULT = os.path.join('logs', 'close_events.jsonl')
 REQUIRED_EVENT_FIELDS = ('ts_utc', 'host', 'venue', 'service', 'mode', 'event', 'severity', 'master_trade_id',
-                         'code_sha')
+                         'code_sha', 'config_sha')
 _ENVELOPE = frozenset(REQUIRED_EVENT_FIELDS)
 
 EV_RECEIVED = 'CLOSE_RECEIVED'                  # a valid CLOSE arrived (master_trade_id, matched rows)
@@ -216,11 +245,13 @@ EV_RESIDUAL = 'CLOSE_RESIDUAL'
 EV_LEG_LEFT = 'CLOSE_LEG_LEFT'
 EV_JOB_EXPIRED = 'CLOSE_JOB_EXPIRED'
 EV_JOB_FAILED = 'CLOSE_JOB_FAILED'
+EV_RESIDUAL_NOT_OURS = 'CLOSE_RESIDUAL_NOT_OURS'  # DONE_ROW_SHARE_CLOSED: the venue rest belongs to the user
+EV_DUST = 'CLOSE_DUST'                          # DONE_DUST: under one lot left on the venue
 EVENT_SEVERITY = {
     EV_RECEIVED: 'INFO', EV_DUPLICATE: 'INFO', EV_NO_MATCH: 'INFO', EV_PAYLOAD_REJECTED: 'WARN',
     EV_JOB_CREATED: 'INFO', EV_JOB_STEP: 'INFO', EV_JOB_OUTCOME: 'INFO', EV_JOB_SKIPPED: 'INFO',
     EV_SIDE_MISMATCH: 'CRITICAL', EV_RESIDUAL: 'CRITICAL', EV_LEG_LEFT: 'WARN', EV_JOB_EXPIRED: 'CRITICAL',
-    EV_JOB_FAILED: 'CRITICAL',
+    EV_JOB_FAILED: 'CRITICAL', EV_RESIDUAL_NOT_OURS: 'WARN', EV_DUST: 'WARN',
 }
 _SEVERITIES = {'debug': 'DEBUG', 'info': 'INFO', 'warn': 'WARN', 'warning': 'WARN', 'error': 'ERROR',
                'critical': 'CRITICAL'}
@@ -228,26 +259,73 @@ _PY_LEVEL = {'DEBUG': logging.DEBUG, 'INFO': logging.INFO, 'WARN': logging.WARNI
              'CRITICAL': logging.CRITICAL}
 
 REDACTED = '[REDACTED]'
-SECRET_KEY_RE = re.compile(r'(?i)(passw|passphrase|secret|token|api[_-]?key|private|credential|authori[sz]|'
-                           r'master[_-]?key|signature|cookie|mnemonic|seed[_-]?phrase)')
-SECRET_VALUE_RE = re.compile(
-    r'(?i:bearer)\s+[^\s"\'\\,]+'                                           # Authorization header values
-    r'|0x[0-9a-fA-F]{64}'                                                   # EVM / HL private keys
-    r'|(?<![0-9A-Za-z])[0-9a-fA-F]{64}(?![0-9A-Za-z])'                      # bare 64-hex keys
-    r'|(?<![A-Za-z0-9+/_-])(?=[A-Za-z0-9+/_-]*[G-Zg-wyz+/_-])[A-Za-z0-9+/_-]{41,}={0,2}')   # long base64; x excluded
-_log = logging.getLogger('close_events')
+# ---- shared redactor (QC 2026-10-06): the same rules and the same adversarial test corpus in the master
+# (massive-rocket-algos t1_eventlog.py) and both followers (this file). ----
+# A dict value is masked when its KEY looks secret. A string is scanned for: bearer values; labelled secrets in text
+# ('X-Master-Key: v', '{"api_key": "v"}', 'masterKey=v', 'FOO_KEY=v', '?key=v', 'password is v', 'sig=v');
+# 0x + 64 hex and bare 64 hex (private keys); long mixed-case+digit tokens (base64 / API secrets).
+# Readable on purpose: 32-hex trade ids, 40-hex addresses, paths/URLs (many separators), and a 64-hex value under
+# a sha/hash-named key (inputs_sha256, code_sha, tx_hash, ...).
+SECRET_KEY_RE = re.compile(r'(?i)(passw|passphrase|secret|token|api[_-]?key|apikey|private|credential|authori[sz]|'
+                           r'master[_-]?key|signature|cookie|mnemonic|seed[_-]?phrase|(?:^|[_-])key$)')
+SAFE_HEX_KEY_RE = re.compile(r'(?i)(sha(256)?|hash|digest|txid)$')
+_HEX64_FULL_RE = re.compile(r'(0x)?[0-9a-fA-F]{64}')
+_BEARER_RE = re.compile(r'(?i)\b(bearer\s+)[^\s"\',;&}\]]+')
+_LABELLED_RE = re.compile(
+    r'(?i)(?<![A-Za-z0-9])([A-Za-z0-9_-]*(?:key|secret|token|passw(?:or)?d|passphrase|signature|authorization|cookie'
+    r'|credentials?|mnemonic)|sig)(["\']?\s*(?:[:=]|\s+is\s+)\s*["\']?)(?:(?:bearer|basic)\s+)?(?!\[REDACTED\])([^\s"\',;&}\]]+)')
+_HEX64_RE = re.compile(r'(?<![0-9A-Za-z])(?:0x)?[0-9a-fA-F]{64}(?![0-9A-Za-z])')
+_LONG_RUN_RE = re.compile(r'[A-Za-z0-9+/_=-]{32,}')
+_ADDRESS_RE = re.compile(r'0x[0-9a-fA-F]{40}')
+SECRET_VALUE_RE = re.compile(r'(?i)\bbearer\s+(?!\[REDACTED\])\S|(?<![0-9A-Za-z])(?:0x)?[0-9a-fA-F]{64}'
+                             r'(?![0-9A-Za-z])')
 
 
-def redact(obj):
-    """A copy of obj with every value under a secret-looking key replaced by REDACTED and every secret-looking
-    substring of a string replaced by REDACTED (32-hex trade ids, 40-hex addresses and shas stay readable)."""
+def _long_run(m):
+    s = m.group(0)
+    core = s.rstrip('=')
+    if _ADDRESS_RE.fullmatch(core):
+        return s
+    if not (re.search('[A-Z]', core) and re.search('[a-z]', core) and re.search('[0-9]', core)):
+        return s
+    if sum(core.count(c) for c in '/_-') > 3:           # paths, URLs and slugs, not random tokens
+        return s
+    return REDACTED
+
+
+def redact_text(s, secrets=()):
+    """s with every secret-looking substring replaced by REDACTED (plus any literal in secrets)."""
+    for lit in secrets or ():
+        if lit:
+            s = s.replace(lit, REDACTED)
+    s = _BEARER_RE.sub(lambda m: m.group(1) + REDACTED, s)
+    s = _LABELLED_RE.sub(lambda m: m.group(1) + m.group(2) + REDACTED, s)
+    s = _HEX64_RE.sub(REDACTED, s)
+    return _LONG_RUN_RE.sub(_long_run, s)
+
+
+def redact(obj, secrets=()):
+    """A copy of obj: values under a secret-looking key -> REDACTED, strings scanned by redact_text(); a 64-hex
+    value under a sha/hash-named key stays readable. Never raises on JSON-like data."""
     if isinstance(obj, dict):
-        return {k: (REDACTED if SECRET_KEY_RE.search(str(k)) else redact(v)) for k, v in obj.items()}
+        out = {}
+        for k, v in obj.items():
+            ks = str(k)
+            if SECRET_KEY_RE.search(ks):
+                out[k] = REDACTED
+            elif isinstance(v, str) and SAFE_HEX_KEY_RE.search(ks) and _HEX64_FULL_RE.fullmatch(v):
+                out[k] = v
+            else:
+                out[k] = redact(v, secrets)
+        return out
     if isinstance(obj, (list, tuple, set, frozenset)):
-        return [redact(v) for v in obj]
+        return [redact(v, secrets) for v in obj]
     if isinstance(obj, str):
-        return SECRET_VALUE_RE.sub(REDACTED, obj)
+        return redact_text(obj, secrets)
     return obj
+
+
+_log = logging.getLogger('close_events')
 
 
 def _open_append(path):
@@ -269,7 +347,8 @@ class CloseEventLog:
     `dropped` counts the lost file line. Size rotation keeps `backups` older files (path.1 newest)."""
 
     def __init__(self, path=LOG_PATH_DEFAULT, *, venue, service, mode='live', host=None, code_sha=None,
-                 max_bytes=5_000_000, backups=5, min_free_bytes=50_000_000, clock=time.time, free_bytes_fn=None):
+                 config=None, max_bytes=5_000_000, backups=5, min_free_bytes=50_000_000, clock=time.time,
+                 free_bytes_fn=None):
         self.path = path
         self.venue, self.service, self.mode = venue, service, mode
         if host is None:
@@ -279,6 +358,13 @@ class CloseEventLog:
                 host = 'unknown'
         self.host = host
         self.code_sha = code_sha or os.getenv('RAILWAY_GIT_COMMIT_SHA') or 'unknown'
+        # config: the close-path env flags (CLOSE_JOBS_ENABLED, CLOSE_SKIP_INACTIVE_USERS, ...); their sha goes in
+        # every record so a flag flip is visible in the log. Log the flags themselves once at startup.
+        try:
+            self.config_sha = (hashlib.sha256(json.dumps(config, sort_keys=True, default=str).encode('utf-8'))
+                               .hexdigest() if config is not None else 'unknown')
+        except Exception:
+            self.config_sha = 'unknown'
         self.max_bytes, self.backups, self.min_free_bytes = max_bytes, backups, min_free_bytes
         self._clock = clock
         self._free = free_bytes_fn or _free_bytes
@@ -297,7 +383,7 @@ class CloseEventLog:
                 ts = time.time()
             rec = {'ts_utc': _iso_ms(ts), 'host': self.host, 'venue': self.venue, 'service': self.service,
                    'mode': self.mode, 'event': str(event), 'severity': sev, 'master_trade_id': master_trade_id,
-                   'code_sha': self.code_sha}
+                   'code_sha': self.code_sha, 'config_sha': self.config_sha}
             for k, v in fields.items():
                 rec['field_%s' % k if k in _ENVELOPE else k] = v
             line = json.dumps(redact(rec), default=str, ensure_ascii=True)
