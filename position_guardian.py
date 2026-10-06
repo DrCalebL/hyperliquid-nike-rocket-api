@@ -57,6 +57,7 @@ from eth_account import Account
 from cryptography.fernet import Fernet
 
 import bracket_guard as bg
+import close_guard
 import follower_guard
 import hl_rate
 from follower_guard import (ACTIVE_STATUSES, filter_actions, real_oid, rec_from_row, row_side, row_ts,
@@ -109,6 +110,12 @@ SQL_PASS_ROWS = ("/* hlg:pass_rows */ SELECT " + _ROW_COLS + " FROM open_positio
                  "ORDER BY op.opened_at DESC")
 SQL_BUSY = ("/* hlg:busy */ SELECT EXISTS (SELECT 1 FROM signal_deliveries WHERE user_id = $1 "
             "AND acknowledged_at > NOW() - INTERVAL '180 seconds' AND ($2::timestamp IS NULL OR acknowledged_at > $2))")
+# T1 CLOSE (spec 19.6): a user with a pending close job, or one done within CLOSE_BUSY_WINDOW_S, is busy like an
+# in-flight token, so a full pass never re-places a leg execute_close cancelled. A DEFERRED job does not count: it
+# waits for the recovery lane to resolve its needs_recovery row, and a busy user would stop that lane (deadlock).
+SQL_CLOSE_BUSY = ("/* hlg:close_busy */ SELECT EXISTS (SELECT 1 FROM close_jobs WHERE user_id = $1 AND "
+                  "(status = 'pending' OR (status = 'done' AND updated_at > NOW() - INTERVAL '%d seconds')))"
+                  % close_guard.CLOSE_BUSY_WINDOW_S)
 SQL_SIGNAL_WINDOW = ("/* hlg:signal_window */ SELECT EXISTS (SELECT 1 FROM signals "
                      "WHERE created_at > NOW() - INTERVAL '180 seconds')")
 SQL_ROW_OPEN = ("/* hlg:row_open */ UPDATE open_positions SET status = 'open', quantity = $2, "
@@ -230,7 +237,18 @@ class HLPositionGuardian:
         `since` is the rows' latest opened_at: only deliveries acknowledged after the row count."""
         if follower_guard.is_inflight(user_id):
             return True
+        if await self._close_busy(user_id):
+            return True
         return bool(await self._fetchval(SQL_BUSY, user_id, since))
+
+    async def _close_busy(self, user_id):
+        """T1 CLOSE: SQL_CLOSE_BUSY. A failed read is NOT busy (no close_jobs table means no close job, and a
+        permanently busy user would switch the guardian off for them); it is logged."""
+        try:
+            return bool(await self._fetchval(SQL_CLOSE_BUSY, user_id))
+        except Exception as e:
+            logger.warning('close_jobs busy read failed for user %s: %r', user_id, e)
+            return False
 
     async def _yield(self, user, coin='*'):
         await self._alarm(user, coin, 'GUARDIAN_YIELD_INFLIGHT', 'info')

@@ -153,7 +153,10 @@ HL_INFO_METHODS = {'user_state', 'open_orders', 'frontend_open_orders', 'all_mid
 HL_EXCHANGE_METHODS = {'order', 'cancel', 'update_leverage', 'market_close', 'bulk_orders', 'modify_order'}
 
 
-POSITION_MONITOR_BASE_SHA256 = '43c742a869ef396ed4236c91c2890d2556736d1a6be1ae9d91a72edf436ca2e6'
+# Re-pinned by T07 (T1 CLOSE, massive-rocket-algos spec 2026-10-06-t1-live-design.md 19.6): the Wave 1 base plus
+# _time_exit_label, the TIME label before the distance relabel and the TIME SL cancel (Wave 1 base was
+# 43c742a869ef396ed4236c91c2890d2556736d1a6be1ae9d91a72edf436ca2e6). tests/test_master_close.py pins that behaviour.
+POSITION_MONITOR_BASE_SHA256 = '788c2307b35845f2d9c3e66a55f6e32d528b284c6eb6865f9a8059704a57b939'
 
 
 def _is_counting_charge(node):

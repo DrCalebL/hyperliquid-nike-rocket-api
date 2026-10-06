@@ -39,7 +39,7 @@ import math
 import json
 import random
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_DOWN
 from typing import Optional, Dict, List
 
@@ -49,6 +49,8 @@ from hyperliquid.utils import constants
 from eth_account import Account
 from cryptography.fernet import Fernet
 
+import bracket_guard as bg
+import close_guard
 import follower_guard
 import hl_rate
 from order_utils import (
@@ -233,6 +235,91 @@ def exchange_ctor_takes_meta(cls=None) -> bool:
     except (TypeError, ValueError):
         return False
     return 'meta' in params and 'spot_meta' in params
+
+
+# ==================== T1 CLOSE (protocol 2): master time-exit closes ====================
+# Spec: massive-rocket-algos docs/superpowers/specs/2026-10-06-t1-live-design.md 19.6-19.8 and 21.
+# POST /api/broadcast-close records master_closes + one close_jobs row per matched position; process_close_jobs()
+# runs them each loop cycle BEFORE the signal poll. Kill switch CLOSE_JOBS_ENABLED=0 (jobs wait, nothing lost);
+# CLOSE_SKIP_INACTIVE_USERS=1 skips stopped/unpaid/no-access users (default: a CLOSE only removes risk, so it
+# reaches every matched row whose credentials decrypt).
+CLOSE_VENUE = 'hyperliquid'
+CLOSE_SERVICE = 'hyperliquid-nike-rocket-api'
+CLOSE_BATCH_SIZE = 25
+CLOSE_JOBS_PER_CYCLE = 500
+CLOSE_ERROR_LOG_EVERY_S = 3600
+SQL_CLOSE_JOBS = (
+    "/* t1c:jobs */ SELECT cj.position_id, cj.user_id, cj.master_trade_id, cj.status AS job_status, cj.attempts, "
+    "EXTRACT(EPOCH FROM (NOW() - cj.created_at)) AS age_s, mc.side AS payload_side, mc.symbol AS payload_symbol, "
+    "u.api_key, u.email, u.hl_private_key_encrypted, u.hl_wallet_address, u.agent_active, u.access_granted, "
+    "u.credentials_set, u.pending_invoice_id, u.invoice_due_date "
+    "FROM close_jobs cj JOIN master_closes mc ON mc.master_trade_id = cj.master_trade_id "
+    "JOIN follower_users u ON u.id = cj.user_id WHERE cj.status IN ('pending', 'deferred') "
+    "ORDER BY cj.created_at LIMIT %d" % CLOSE_JOBS_PER_CYCLE)
+SQL_CLOSE_ROW = ("/* t1c:row */ SELECT id, user_id, signal_id, tp_order_id, sl_order_id, symbol, hl_coin, side, "
+                 "quantity, status, exit_hint, close_fill_qty FROM open_positions WHERE id = $1")
+SQL_CLOSE_JOB_SET = ("/* t1c:job_set */ UPDATE close_jobs SET status = $2, attempts = $3, last_error = $4, "
+                     "updated_at = NOW() WHERE position_id = $1 AND status IN ('pending', 'deferred')")
+SQL_CLOSE_HINT = ("/* t1c:hint */ UPDATE open_positions SET exit_hint = 'TIME' "
+                  "WHERE id = $1 AND status IN ('open', 'needs_recovery')")
+SQL_CLOSE_FILL = ("/* t1c:fill */ UPDATE open_positions SET close_fill_qty = COALESCE(close_fill_qty, 0) + $2 "
+                  "WHERE id = $1")
+CLOSE_CRITICAL_NOTIFY = frozenset({close_guard.EV_SIDE_MISMATCH, close_guard.EV_JOB_FAILED,
+                                   close_guard.EV_JOB_EXPIRED, close_guard.EV_RESIDUAL})
+
+
+def close_flags() -> Dict:
+    """The close-path env flags (logged once at the first cycle; their sha is in every close event)."""
+    return {'CLOSE_JOBS_ENABLED': (os.getenv('CLOSE_JOBS_ENABLED') or '1').strip() != '0',
+            'CLOSE_SKIP_INACTIVE_USERS': (os.getenv('CLOSE_SKIP_INACTIVE_USERS') or '0').strip() == '1'}
+
+
+_CLOSE_LOG = None
+
+
+def close_event_log():
+    """The process-wide section-21 close event log (logs/close_events.jsonl + the 'close_events' logger)."""
+    global _CLOSE_LOG
+    if _CLOSE_LOG is None:
+        _CLOSE_LOG = close_guard.CloseEventLog(venue=CLOSE_VENUE, service=CLOSE_SERVICE, mode='live',
+                                               config=close_flags())
+    return _CLOSE_LOG
+
+
+def close_user_active(job: Dict) -> bool:
+    """The entry path's user filter (agent on, credentials, access, invoice not overdue) on a close job row."""
+    if not (job.get('agent_active') and job.get('credentials_set') and job.get('access_granted')):
+        return False
+    if job.get('pending_invoice_id') is None or job.get('invoice_due_date') is None:
+        return True
+    due = job['invoice_due_date']
+    if getattr(due, 'tzinfo', None) is not None:
+        due = due.astimezone(timezone.utc).replace(tzinfo=None)
+    return due > datetime.utcnow()
+
+
+class _FillMeter:
+    """Wraps an SDK Exchange for the close path: every order() passes through and its 'filled' totalSz is added up,
+    so execute_close records only what ITS reduce-only orders filled (never a position delta: an SL that fires
+    between the read and the close must keep its SL label). `unknown` is set when a fill carries no totalSz."""
+
+    def __init__(self, exchange):
+        self._ex = exchange
+        self.filled = 0.0
+        self.unknown = False
+
+    def order(self, *args, **kwargs):
+        result = self._ex.order(*args, **kwargs)
+        st = first_status(result)
+        if (result or {}).get('status') == 'ok' and isinstance(st, dict) and 'filled' in st:
+            try:
+                self.filled += float((st.get('filled') or {}).get('totalSz'))
+            except (TypeError, ValueError):
+                self.unknown = True
+        return result
+
+    def __getattr__(self, name):
+        return getattr(self._ex, name)
 
 
 class HostedTradingLoop:
@@ -1023,11 +1110,335 @@ class HostedTradingLoop:
                 {"coin": coin, "entry_order_id": entry_order_id})
         return close_success
 
+    # ==================== T1 CLOSE: master time-exit close jobs (spec 19.6 / 19.7) ====================
+
+    async def process_close_jobs(self) -> int:
+        """Run every pending/deferred close job once, in 25-job gather batches. Returns the number of jobs run;
+        0 while CLOSE_JOBS_ENABLED=0 (the endpoint still records closes and jobs, so nothing is lost)."""
+        flags = close_flags()
+        if not getattr(self, '_close_config_logged', False):
+            self._close_config_logged = True
+            close_event_log().emit('CLOSE_CONFIG', **flags)
+        if not flags['CLOSE_JOBS_ENABLED']:
+            return 0
+        async with self.db_pool.acquire() as conn:
+            jobs = [dict(r) for r in await conn.fetch(SQL_CLOSE_JOBS)]
+        for i in range(0, len(jobs), CLOSE_BATCH_SIZE):
+            await asyncio.gather(*[self.execute_close(job, flags) for job in jobs[i:i + CLOSE_BATCH_SIZE]],
+                                 return_exceptions=True)
+        return len(jobs)
+
+    async def execute_close(self, job: Dict, flags: Optional[Dict] = None) -> str:
+        """One close job: 24 h expiry, the inactive-user policy, then the money-safety steps of 19.7 under the
+        user's in-flight token (a user already in flight is skipped and retried next cycle). Never raises;
+        returns the job's resulting status ('busy' / 'error' leave it unchanged)."""
+        flags = flags or close_flags()
+        uid, pid, mid = job['user_id'], job['position_id'], job['master_trade_id']
+        try:
+            age = float(job.get('age_s') or 0)
+            if age > close_guard.CLOSE_JOB_MAX_AGE_S:
+                await self._close_alarm(job, close_guard.EV_JOB_EXPIRED,
+                                        f"close job not done after {age / 3600:.1f} h; the position keeps its SL/TP",
+                                        age_s=round(age))
+                await self._close_job_set(job, 'expired', job.get('attempts') or 0, 'expired after 24 h')
+                return 'expired'
+            if flags.get('CLOSE_SKIP_INACTIVE_USERS') and not close_user_active(job):
+                await self._close_alarm(job, close_guard.EV_JOB_SKIPPED,
+                                        'inactive user skipped (CLOSE_SKIP_INACTIVE_USERS=1): the position keeps its '
+                                        'SL/TP', severity='warn', reason='inactive_user')
+                await self._close_job_set(job, 'skipped', job.get('attempts') or 0, 'inactive user')
+                return 'skipped'
+            if follower_guard.is_inflight(uid):
+                close_event_log().emit(close_guard.EV_JOB_SKIPPED, master_trade_id=mid, position_id=pid, user_id=uid,
+                                       reason='user_in_flight')
+                return 'busy'
+            tok = follower_guard.mark(uid)          # the guardian and the entry path treat the user as busy
+            try:
+                return await self._execute_close_body(job)
+            finally:
+                follower_guard.clear(uid, tok)
+        except Exception as e:
+            self.logger.error(f"❌ CLOSE job {pid} ({mid}) raised: {type(e).__name__}: {str(e)[:200]}")
+            close_event_log().emit('CLOSE_JOB_EXCEPTION', severity='error', master_trade_id=mid, position_id=pid,
+                                   user_id=uid, error=repr(e)[:300])
+            return 'error'
+
+    async def _execute_close_body(self, job: Dict) -> str:
+        """19.7: re-read the row -> read the venue -> cancel the TP by id -> re-read -> exit_hint='TIME' -> reduce-only
+        close of min(venue, row remainder) -> verify flat -> record the fill -> cancel the SL by id. The SL stays
+        live until the position is verified flat (I3); a read error never acts (I8)."""
+        side = job.get('payload_side')
+        attempts = int(job.get('attempts') or 0)
+        async with self.db_pool.acquire() as conn:
+            row = await conn.fetchrow(SQL_CLOSE_ROW, job['position_id'])
+        row = dict(row) if row is not None else None
+        if row is None:
+            self._close_step(job, 'row', detail='row not found')
+            await self._close_job_set(job, 'done', attempts, 'row not found')
+            return 'done'
+        pre = close_guard.plan_close_step(row, bg.UNKNOWN, side, lot=1)
+        if pre.code == close_guard.DONE_ROW_INACTIVE:
+            self._close_step(job, 'row', **pre.as_log())
+            await self._close_job_set(job, 'done', attempts, None)
+            return 'done'
+        if pre.code == close_guard.DEFER_RECOVERY:
+            if job.get('job_status') != 'deferred':
+                self._close_step(job, 'row', **pre.as_log())
+                await self._close_job_set(job, 'deferred', attempts, 'needs_recovery: the recovery lane owns it')
+            return 'deferred'
+
+        coin = row.get('hl_coin') or convert_symbol_to_hl(row.get('symbol') or '')
+        lot = self._close_lot(coin)
+        if lot is None:
+            return await self._close_retry(job, attempts + 1, f'no asset metadata for {coin}')
+        user = {'id': job['user_id'], 'api_key': job.get('api_key') or '', 'email': job.get('email'),
+                'hl_private_key_encrypted': job.get('hl_private_key_encrypted'),
+                'hl_wallet_address': job.get('hl_wallet_address')}
+        try:
+            info, exchange, wallet = self.get_or_create_exchange(user)
+        except Exception as e:
+            await self._close_alarm(job, close_guard.EV_JOB_FAILED,
+                                    f'credentials unusable ({type(e).__name__}): no order sent, the position keeps its '
+                                    f'SL/TP')
+            await self._close_job_set(job, 'failed', attempts, f'credentials unusable: {type(e).__name__}')
+            return 'failed'
+
+        pos, err = await self._close_read(info, wallet, coin)
+        step = close_guard.plan_close_step(row, pos, side, lot=lot)
+        self._close_step(job, 'read', error=err, **step.as_log())
+        settled = await self._close_settle(job, row, step, exchange, coin, attempts, tp_cancelled=False)
+        if settled:
+            return settled
+
+        # 19.7 step 5: the TP first, by recorded id (not-found = done); a failed cancel stops this attempt
+        tp_oid = follower_guard.real_oid(row.get('tp_order_id'))
+        if tp_oid:
+            ok = await cancel_order_verified(exchange, coin, tp_oid, 'TP before a master CLOSE')
+            self._close_step(job, 'cancel_tp', oid=tp_oid, ok=ok)
+            if not ok:
+                return await self._close_retry(job, attempts + 1, 'TP cancel failed')
+        pos, err = await self._close_read(info, wallet, coin)          # a TP partial fill shrinks the position
+        step = close_guard.plan_close_step(row, pos, side, lot=lot)
+        self._close_step(job, 'reread', error=err, **step.as_log())
+        settled = await self._close_settle(job, row, step, exchange, coin, attempts, tp_cancelled=True)
+        if settled:
+            return settled
+
+        # 19.7 step 6: the hint is on the row BEFORE the order (position_monitor labels TIME only with a fill)
+        try:
+            async with self.db_pool.acquire() as conn:
+                await conn.execute(SQL_CLOSE_HINT, row['id'])
+        except Exception as e:
+            return await self._close_retry(job, attempts + 1, f'exit_hint write failed: {str(e)[:150]}')
+        self._close_step(job, 'write_hint', exit_hint='TIME')
+
+        # 19.7 step 7: reduce-only close of min(venue, row remainder), never more (I1)
+        meter = _FillMeter(exchange)
+        is_buy_to_close = step.exit_side == 'buy'
+        if step.residual:
+            await self._close_share(meter, info, wallet, coin, is_buy_to_close, step.qty)
+        else:
+            await hl_close_with_verification(meter, info, wallet, coin, is_buy_to_close, step.qty, self.round_price,
+                                             source='trading')
+        after, err = await self._close_read(info, wallet, coin)
+        filled = min(meter.filled, step.qty)
+        if meter.unknown:                       # a 'filled' without totalSz: estimate from the position, never low
+            if isinstance(after, bg.Pos) and after.side == (-1 if is_buy_to_close else 1):
+                filled = max(filled, min(step.qty, max(0.0, (step.venue_qty or 0) - after.qty)))
+            else:
+                filled = step.qty
+        self._close_step(job, 'close', qty=step.qty, exit_side=step.exit_side, reduce_only=True,
+                         residual=step.residual, filled=filled, fill_unknown=meter.unknown)
+        if filled > 0:
+            try:
+                async with self.db_pool.acquire() as conn:
+                    await conn.execute(SQL_CLOSE_FILL, row['id'], Decimal(repr(float(filled))))
+                self._close_step(job, 'record_fill', close_fill_qty_added=filled)
+            except Exception as e:
+                self.logger.critical(f"   🚨 CLOSE fill record failed for row {row['id']}: {e}")
+                close_event_log().emit('CLOSE_FILL_RECORD_FAILED', severity='critical',
+                                       master_trade_id=job['master_trade_id'], position_id=row['id'],
+                                       user_id=job['user_id'], filled=filled, error=repr(e)[:200])
+        if after is None:
+            self._close_step(job, 'verify_flat', flat=True)
+            return await self._close_finish(job, row, exchange, coin, attempts)
+        attempts += 1
+        left = after.qty if isinstance(after, bg.Pos) else None
+        self._close_step(job, 'verify_flat', flat=False, venue_qty=left, error=err)
+        await self._close_alarm(job, close_guard.EV_RESIDUAL,
+                                f'not flat after the close (venue {left if left is not None else "unknown"}); '
+                                f'the SL is kept', notify=attempts == 1, venue_qty=left, filled=filled,
+                                attempts=attempts)
+        if attempts >= close_guard.CLOSE_JOB_MAX_ATTEMPTS:
+            await self._close_alarm(job, close_guard.EV_JOB_FAILED,
+                                    f'not flat after {attempts} attempts; the SL is kept, check the account',
+                                    attempts=attempts)
+            await self._close_job_set(job, 'failed', attempts, 'not flat after the close')
+            return 'failed'
+        return await self._close_retry(job, attempts, 'not flat after the close')
+
+    async def _close_settle(self, job, row, step, exchange, coin, attempts, tp_cancelled) -> Optional[str]:
+        """Every plan_close_step code except CLOSE ends this attempt here; None means 'go on and close'."""
+        code = step.code
+        if code == close_guard.CLOSE:
+            return None
+        if code == close_guard.RETRY_READ_UNKNOWN:
+            return await self._close_retry(job, attempts + 1, f'venue read unknown: {step.detail}')
+        if code == close_guard.DONE_ALREADY_FLAT:
+            if tp_cancelled:                    # 19.7 step 5: flat after the TP cancel -> step 8 (the SL)
+                return await self._close_finish(job, row, exchange, coin, attempts)
+            await self._close_job_set(job, 'done', attempts, None)
+            return 'done'
+        if code == close_guard.FAIL_SIDE_MISMATCH:
+            await self._close_alarm(job, close_guard.EV_SIDE_MISMATCH, f'no order sent: {step.detail}')
+            await self._close_job_set(job, 'failed', attempts, step.detail)
+            return 'failed'
+        if code == close_guard.DONE_ROW_SHARE_CLOSED:
+            await self._close_alarm(job, close_guard.EV_RESIDUAL_NOT_OURS,
+                                    f'the row share is closed; the venue rest ({step.venue_qty}) is the user\'s own',
+                                    venue_qty=step.venue_qty, close_fill_qty=step.close_fill_qty)
+            for key, label in (('tp_order_id', 'TP'), ('sl_order_id', 'SL')):
+                oid = follower_guard.real_oid(row.get(key))
+                if oid and not await cancel_order_verified(exchange, coin, oid, f'{label} after a master CLOSE'):
+                    await self._close_alarm(job, close_guard.EV_LEG_LEFT, f'{label} {oid} could not be cancelled',
+                                            oid=oid)
+            await self._close_job_set(job, 'done', attempts, None)
+            return 'done'
+        if code == close_guard.DONE_DUST:
+            await self._close_alarm(job, close_guard.EV_DUST, 'under one lot left on the venue: nothing to close',
+                                    venue_qty=step.venue_qty)
+            await self._close_job_set(job, 'done', attempts, None)
+            return 'done'
+        if code == close_guard.DEFER_RECOVERY:
+            await self._close_job_set(job, 'deferred', attempts, 'needs_recovery: the recovery lane owns it')
+            return 'deferred'
+        if code == close_guard.DONE_ROW_INACTIVE:
+            await self._close_job_set(job, 'done', attempts, None)
+            return 'done'
+        await self._close_alarm(job, close_guard.EV_JOB_FAILED, f'no order sent ({code}): {step.detail}')
+        await self._close_job_set(job, 'failed', attempts, f'{code}: {step.detail}')
+        return 'failed'
+
+    async def _close_finish(self, job, row, exchange, coin, attempts) -> str:
+        """19.7 step 8: flat -> cancel the SL by recorded id; a failure is CLOSE_LEG_LEFT (the guardian's
+        _cancel_row_legs removes it). The job is done either way."""
+        sl_oid = follower_guard.real_oid(row.get('sl_order_id'))
+        if sl_oid:
+            ok = await cancel_order_verified(exchange, coin, sl_oid, 'SL after a master CLOSE (verified flat)')
+            self._close_step(job, 'cancel_sl', oid=sl_oid, ok=ok)
+            if not ok:
+                await self._close_alarm(job, close_guard.EV_LEG_LEFT,
+                                        f'SL {sl_oid} could not be cancelled after the verified-flat close', oid=sl_oid)
+        await self._close_job_set(job, 'done', attempts, None)
+        return 'done'
+
+    async def _close_share(self, meter, info, wallet, coin, is_buy_to_close, qty):
+        """The residual case (the venue holds more than the row's share): the C41 reduce-only IOC ladder, but every
+        rung sends only what is LEFT of the share (qty - filled so far), so a partial fill can never grow the
+        close past the row (I1). A fill without totalSz stops the ladder (assumed filled)."""
+        loop = asyncio.get_running_loop()
+        for i, slip in enumerate(CLOSE_LADDER):
+            left = self.round_size(coin, qty - meter.filled)
+            if left <= 0 or meter.unknown:
+                return
+            if i:
+                await asyncio.sleep(i)
+            try:
+                hl_rate.charge(hl_rate.W_ALL_MIDS, 'trading')
+                mids = await loop.run_in_executor(None, info.all_mids)
+                mid = float((mids or {}).get(coin) or 0)
+                if mid <= 0:
+                    self.logger.critical(f"   ❌ CLOSE share attempt {i + 1}: no mid price for {coin}")
+                    continue
+                px = self.round_price(mid * (1 + slip) if is_buy_to_close else mid * (1 - slip))
+                hl_rate.charge(hl_rate.W_ACTION, 'trading')
+                await loop.run_in_executor(None, functools.partial(
+                    meter.order, coin, is_buy_to_close, left, px, {"limit": {"tif": "Ioc"}}, True))
+            except Exception as e:
+                self.logger.critical(f"   ❌ CLOSE share attempt {i + 1} ({slip:.0%}) raised: {e}")
+
+    async def _close_read(self, info, wallet, coin):
+        """(bracket_guard.Pos | None for flat | bracket_guard.UNKNOWN, error text) from one user_state read."""
+        try:
+            hl_rate.charge(hl_rate.W_USER_STATE, 'trading')
+            state = await asyncio.to_thread(info.user_state, wallet)
+            szi = coin_szi(state, coin)
+        except Exception as e:
+            return bg.UNKNOWN, f'{type(e).__name__}: {str(e)[:150]}'
+        if szi == 0:
+            return None, None
+        return bg.Pos(1 if szi > 0 else -1, abs(szi)), None
+
+    def _close_lot(self, coin: str) -> Optional[float]:
+        """The coin's lot (10 ** -szDecimals), reloading the metadata once when the coin is missing; None if unknown."""
+        if coin not in self.asset_meta:
+            self._load_asset_meta()
+        meta = self.asset_meta.get(coin)
+        if not meta or meta.get('szDecimals') is None:
+            return None
+        try:
+            return 10 ** -int(meta['szDecimals'])
+        except (TypeError, ValueError):
+            return None
+
+    def _close_step(self, job: Dict, stage: str, **fields):
+        """CLOSE_JOB_STEP: `step` is the execute_close stage; a planner record (CloseStep.as_log) goes in as `plan`."""
+        if 'step' in fields:
+            fields['plan'] = fields.pop('step')
+        close_event_log().emit(close_guard.EV_JOB_STEP, master_trade_id=job['master_trade_id'],
+                               position_id=job['position_id'], user_id=job['user_id'], step=stage, **fields)
+
+    async def _close_retry(self, job: Dict, attempts: int, error: str) -> str:
+        await self._close_job_set(job, 'pending', attempts, error)
+        return 'pending'
+
+    async def _close_job_set(self, job: Dict, status: str, attempts: int, error) -> bool:
+        """Status-guarded job write (a done/failed job never reopens) + a CLOSE_JOB_OUTCOME event."""
+        err = str(error)[:500] if error else None
+        try:
+            async with self.db_pool.acquire() as conn:
+                await conn.execute(SQL_CLOSE_JOB_SET, job['position_id'], status, int(attempts), err)
+        except Exception as e:
+            self.logger.error(f"❌ close_jobs UPDATE failed for row {job['position_id']}: {e}")
+            close_event_log().emit('CLOSE_JOB_WRITE_FAILED', severity='error', master_trade_id=job['master_trade_id'],
+                                   position_id=job['position_id'], user_id=job['user_id'], status=status,
+                                   error=repr(e)[:200])
+            return False
+        close_event_log().emit(close_guard.EV_JOB_OUTCOME, master_trade_id=job['master_trade_id'],
+                               position_id=job['position_id'], user_id=job['user_id'], status=status,
+                               previous=job.get('job_status'), attempts=int(attempts), last_error=err)
+        job['job_status'], job['attempts'] = status, int(attempts)
+        return True
+
+    async def _close_alarm(self, job: Dict, event: str, message: str, severity: Optional[str] = None,
+                           notify: bool = True, **fields):
+        """A close-path alarm: the close event, an error_logs row (named like the event) and, for the critical
+        ones (side mismatch, job failed/expired, residual), an admin e-mail."""
+        close_event_log().emit(event, severity=severity, master_trade_id=job['master_trade_id'],
+                               position_id=job['position_id'], user_id=job['user_id'], message=message, **fields)
+        await log_error_to_db(self.db_pool, job.get('api_key') or 'system', event, message,
+                              {'position_id': job['position_id'], 'master_trade_id': job['master_trade_id']})
+        if notify and event in CLOSE_CRITICAL_NOTIFY:
+            await notify_admin(title=f"{event} (HL)",
+                               details={'User': job.get('email'), 'Position': job['position_id'],
+                                        'Master Trade': job['master_trade_id'], 'Detail': message},
+                               level='error')
+
     async def poll_and_execute(self):
         """
         Single poll cycle - check all users for signals.
         Batched execution.
         """
+        # T1 CLOSE: master close jobs run first, and their failure never blocks the signal poll
+        try:
+            await self.process_close_jobs()
+        except Exception as e:
+            self.logger.error(f"❌ process_close_jobs failed: {type(e).__name__}: {str(e)[:200]}")
+            now = datetime.utcnow()
+            last = getattr(self, '_close_error_logged_at', None)
+            if last is None or (now - last).total_seconds() >= CLOSE_ERROR_LOG_EVERY_S:
+                self._close_error_logged_at = now
+                await log_error_to_db(self.db_pool, "system", "CLOSE_JOBS_ERROR", str(e)[:200])
         pending = await self.get_pending_signals_batched()
         
         if not pending:

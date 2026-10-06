@@ -371,7 +371,34 @@ if DATABASE_URL:
             conn.commit()
         except Exception:
             conn.rollback()
-        
+
+        # T1 CLOSE (protocol 2, spec 19.6): master_trade_id linkage, exit hint, master_closes + close_jobs.
+        # Additive and idempotent; its own transaction so a failure never undoes the migrations above.
+        try:
+            for stmt in (
+                "ALTER TABLE signals ADD COLUMN IF NOT EXISTS master_trade_id VARCHAR(32)",
+                "CREATE UNIQUE INDEX IF NOT EXISTS ux_signals_master_trade_id ON signals(master_trade_id) "
+                "WHERE master_trade_id IS NOT NULL",
+                "ALTER TABLE open_positions ADD COLUMN IF NOT EXISTS exit_hint VARCHAR(16)",
+                "ALTER TABLE open_positions ADD COLUMN IF NOT EXISTS close_fill_qty NUMERIC",
+                "CREATE TABLE IF NOT EXISTS master_closes (master_trade_id VARCHAR(32) PRIMARY KEY, "
+                "symbol VARCHAR NOT NULL, side VARCHAR(4) NOT NULL, reason VARCHAR(32) NOT NULL, "
+                "master_closed_ms BIGINT NOT NULL, received_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, "
+                "matched INTEGER DEFAULT 0)",
+                "CREATE TABLE IF NOT EXISTS close_jobs (position_id INTEGER PRIMARY KEY REFERENCES open_positions(id), "
+                "user_id INTEGER NOT NULL REFERENCES follower_users(id), master_trade_id VARCHAR(32) NOT NULL, "
+                "status VARCHAR(16) NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0, "
+                "last_error TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, "
+                "updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
+                "CREATE INDEX IF NOT EXISTS ix_close_jobs_status ON close_jobs(status)",
+                "CREATE INDEX IF NOT EXISTS ix_close_jobs_user_id ON close_jobs(user_id)",
+            ):
+                cur.execute(stmt)
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            print(f"⚠️ T1 CLOSE migration failed (close jobs stay inert): {e}")
+
         conn.commit()
         cur.close()
         conn.close()

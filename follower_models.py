@@ -12,7 +12,7 @@ Supports:
 Author: Nike Rocket Team
 """
 
-from sqlalchemy import Column, Integer, String, Float, Boolean, DateTime, ForeignKey, Text, Numeric, UniqueConstraint
+from sqlalchemy import Column, Integer, BigInteger, String, Float, Boolean, DateTime, ForeignKey, Text, Numeric, UniqueConstraint
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship, sessionmaker
 from datetime import datetime, timedelta
@@ -163,11 +163,15 @@ class Signal(Base):
     trend_strength = Column(Float, nullable=True)
     volatility = Column(Float, nullable=True)
     notes = Column(String, nullable=True)
-    
+
     # Timing
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
     expires_at = Column(DateTime, nullable=True)
-    
+
+    # T1 CLOSE (protocol 2): the master's trade id (32 lowercase hex). NULL for v1 entries; unique when set
+    # (partial index ux_signals_master_trade_id, main.py migration). A CLOSE matches positions ONLY through it.
+    master_trade_id = Column(String(32), nullable=True)
+
     # Relationships
     deliveries = relationship("SignalDelivery", back_populates="signal")
 
@@ -234,9 +238,41 @@ class OpenPosition(Base):
     
     # Status: open, closed, closed_manual, needs_review, error
     status = Column(String, default='open')
-    
+
+    # T1 CLOSE: execute_close writes exit_hint='TIME' before its reduce-only close and adds every fill of that close
+    # to close_fill_qty (cumulative); position_monitor labels the exit TIME only when both are set.
+    exit_hint = Column(String(16), nullable=True)
+    close_fill_qty = Column(Numeric, nullable=True)
+
     # Relationships
     user = relationship("User")
+
+
+class MasterClose(Base):
+    """T1 CLOSE (protocol 2): one row per master CLOSE received; the primary key makes the receipt idempotent."""
+    __tablename__ = "master_closes"
+
+    master_trade_id = Column(String(32), primary_key=True)
+    symbol = Column(String, nullable=False)
+    side = Column(String(4), nullable=False)            # side of the ENTRY being closed: BUY | SELL
+    reason = Column(String(32), nullable=False)         # 'time_exit'
+    master_closed_ms = Column(BigInteger, nullable=False)
+    received_at = Column(DateTime, default=datetime.utcnow)
+    matched = Column(Integer, default=0)                # followers_matched at first receipt
+
+
+class CloseJob(Base):
+    """T1 CLOSE: one job per matched open_positions row (status pending/deferred/done/failed/skipped/expired)."""
+    __tablename__ = "close_jobs"
+
+    position_id = Column(Integer, ForeignKey("open_positions.id"), primary_key=True)
+    user_id = Column(Integer, ForeignKey("follower_users.id"), nullable=False)
+    master_trade_id = Column(String(32), nullable=False, index=True)
+    status = Column(String(16), nullable=False, default='pending', index=True)
+    attempts = Column(Integer, nullable=False, default=0)
+    last_error = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow)
 
 
 class PositionFill(Base):
@@ -421,7 +457,8 @@ def init_db(engine):
         'follower_users', 'signals', 'signal_deliveries',
         'trades', 'payments', 'system_stats', 'open_positions',
         'balance_snapshots', 'error_logs', 'position_fills',
-        'portfolio_snapshots', 'portfolio_transactions'
+        'portfolio_snapshots', 'portfolio_transactions',
+        'master_closes', 'close_jobs'
     ]
     
     missing = [t for t in required_tables if t not in tables]
@@ -434,6 +471,6 @@ def init_db(engine):
 __all__ = [
     'Base', 'User', 'Signal', 'SignalDelivery', 'OpenPosition', 'PositionFill',
     'Trade', 'Payment', 'SystemStats', 'BalanceSnapshot', 'ErrorLog',
-    'PortfolioSnapshot', 'PortfolioTransaction',
+    'PortfolioSnapshot', 'PortfolioTransaction', 'MasterClose', 'CloseJob',
     'get_db_session', 'init_db'
 ]
