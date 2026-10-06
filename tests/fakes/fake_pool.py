@@ -182,6 +182,15 @@ class FakeDB:
         floor = self.now() - timedelta(seconds=180)
         return any(sg['created_at'] > floor for sg in self.signals.values())
 
+    def _hlg_close_busy(self, verb, s, args):
+        """T1 CLOSE (19.6): a pending close job, or one done within the window in the SQL (CloseDB holds jobs)."""
+        uid = args[0]
+        window = int(re.search(r"INTERVAL '(\d+) seconds'", s).group(1))
+        floor = self.now() - timedelta(seconds=window)
+        return any(j['user_id'] == uid and (j['status'] == 'pending' or (j['status'] == 'done'
+                                                                           and j['updated_at'] > floor))
+                   for j in getattr(self, 'close_jobs', {}).values())
+
     def _guarded(self, rid, statuses, **changes):
         r = self.positions.get(rid)
         if r is None or r['status'] not in statuses:

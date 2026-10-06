@@ -36,6 +36,7 @@ from hyperliquid.exchange import Exchange
 from hyperliquid.utils import constants
 from eth_account import Account
 from cryptography.fernet import Fernet
+import follower_guard
 import hl_rate
 
 from config import (
@@ -623,6 +624,31 @@ class PositionMonitor:
             traceback.print_exc()
             return False
     
+    async def _time_exit_label(self, position: dict) -> Optional[str]:
+        """T1 CLOSE (spec 19.6): 'TIME' when execute_close wrote exit_hint='TIME' and its close filled
+        (close_fill_qty > 0); 'DEFER' when the hint is set, no fill is recorded yet and the user's close is still in
+        flight (re-check next tick, so a mid-close tick never mislabels it); None otherwise (distance label as
+        before). A failed read is None: the exit keeps today's label."""
+        try:
+            async with self.db_pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    "/* t1c:exit_hint */ SELECT exit_hint, close_fill_qty FROM open_positions WHERE id = $1",
+                    position['id'])
+        except Exception as e:
+            self.logger.warning(f"⚠️ exit_hint read failed for position {position.get('id')}: {e}")
+            return None
+        if not row or row['exit_hint'] != 'TIME':
+            return None
+        try:
+            filled = float(row['close_fill_qty'] or 0)
+        except (TypeError, ValueError):
+            filled = 0.0
+        if filled > 0:
+            return 'TIME'
+        if follower_guard.is_inflight(position.get('user_id')):
+            return 'DEFER'
+        return None
+
     async def check_position(self, position: dict):
         """Check a single position - is it still open on Hyperliquid?"""
         user_short = position['user_api_key'][:15] + "..."
@@ -676,8 +702,15 @@ class PositionMonitor:
             
             dist_to_tp = abs(exit_price - tp)
             dist_to_sl = abs(exit_price - sl)
-            
-            if dist_to_tp < dist_to_sl:
+
+            # T1 CLOSE (spec 19.6): a master time exit closed it (exit_hint='TIME' and our close filled)
+            time_exit = await self._time_exit_label(position)
+            if time_exit == 'DEFER':
+                return
+            if time_exit == 'TIME':
+                exit_type = 'TIME'
+                self.logger.info(f"⏱️ {user_short}: TIME EXIT (master CLOSE) on {position['symbol']} @ ${exit_price:.4f}")
+            elif dist_to_tp < dist_to_sl:
                 exit_type = 'TP'
                 self.logger.info(f"🎯 {user_short}: TP HIT on {position['symbol']} @ ${exit_price:.4f}")
             else:
@@ -706,6 +739,13 @@ class PositionMonitor:
                 self.logger.info(f"   ✅ Cancelled remaining {('SL' if exit_type == 'TP' else 'TP')} order")
             except Exception as e:
                 self.logger.debug(f"   Could not cancel order: {e}")
+            if exit_type == 'TIME':
+                # T1 CLOSE: the SL too, by recorded id; not-found (already cancelled by execute_close) is done
+                try:
+                    hl_rate.charge(hl_rate.W_ACTION, 'monitor')
+                    exchange.cancel(coin, int(position['sl_order_id']))
+                except Exception as e:
+                    self.logger.debug(f"   Could not cancel the SL after a TIME exit: {e}")
             
             # Scan fills for audit trail
             user_info = {

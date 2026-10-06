@@ -22,8 +22,9 @@ Author: Nike Rocket Team
 Updated: November 24, 2025
 """
 
-from fastapi import APIRouter, HTTPException, Header, Depends, BackgroundTasks
+from fastapi import APIRouter, HTTPException, Header, Depends, BackgroundTasks, Request
 from fastapi.responses import JSONResponse, HTMLResponse
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict
@@ -33,11 +34,13 @@ import hashlib
 import hmac
 import json
 import logging
+import time
 from pydantic import BaseModel, EmailStr
 from hyperliquid.info import Info
 from hyperliquid.utils import constants
 from eth_account import Account
 
+import close_guard
 import signal_guard
 
 from follower_models import (
@@ -62,6 +65,49 @@ COINBASE_API_KEY = os.getenv("COINBASE_COMMERCE_API_KEY", "")
 
 # Signal expiration settings
 SIGNAL_EXPIRATION_MINUTES = 15  # Signals expire after 15 minutes
+
+# T1 CLOSE (protocol 2): symbols a CLOSE may name, in the entry-broadcast format (comma-separated env override)
+CLOSE_KNOWN_SYMBOLS_DEFAULT = 'ADA/USDT'
+ENTRY_PROTOCOLS = (1, 2)
+
+SQL_SIGNAL_V2_INSERT = (
+    "INSERT INTO signals (signal_id, action, symbol, entry_price, stop_loss, take_profit, leverage, risk_pct, "
+    "timeframe, trend_strength, volatility, notes, created_at, master_trade_id) VALUES (:signal_id, :action, "
+    ":symbol, :entry_price, :stop_loss, :take_profit, :leverage, :risk_pct, :timeframe, :trend_strength, "
+    ":volatility, :notes, :created_at, :master_trade_id) ON CONFLICT DO NOTHING RETURNING id")
+SQL_MASTER_CLOSE_INSERT = (
+    "INSERT INTO master_closes (master_trade_id, symbol, side, reason, master_closed_ms, received_at, matched) "
+    "VALUES (:m, :symbol, :side, :reason, :closed_ms, :now, 0) ON CONFLICT DO NOTHING RETURNING master_trade_id")
+# 19.4 step 5: matching is ONLY by master_trade_id through the row's signal, active rows only (never symbol/user/time)
+SQL_CLOSE_JOBS_INSERT = (
+    "INSERT INTO close_jobs (position_id, user_id, master_trade_id, status, attempts, created_at, updated_at) "
+    "SELECT op.id, op.user_id, :m, 'pending', 0, :now, :now FROM open_positions op JOIN signals s "
+    "ON op.signal_id = s.id WHERE s.master_trade_id = :m AND op.status IN ('open', 'needs_recovery') "
+    "ON CONFLICT DO NOTHING RETURNING position_id, user_id")
+
+
+def close_known_symbols():
+    raw = os.getenv('CLOSE_KNOWN_SYMBOLS') or CLOSE_KNOWN_SYMBOLS_DEFAULT
+    return frozenset(s.strip() for s in raw.split(',') if s.strip())
+
+
+def _now_ms():
+    return int(time.time() * 1000)
+
+
+def _close_log():
+    """The shared section-21 close event log (hosted_trading_loop owns it, so one file and one config sha)."""
+    import hosted_trading_loop
+    return hosted_trading_loop.close_event_log()
+
+
+def _entry_v2_error(signal) -> Optional[str]:
+    """Protocol-2 entry fields: protocol 1|2; master_trade_id, when present, 32 lowercase hex."""
+    if signal.protocol not in ENTRY_PROTOCOLS:
+        return 'protocol must be 1 or 2'
+    if signal.master_trade_id is not None and not close_guard.is_master_trade_id(signal.master_trade_id):
+        return 'master_trade_id must be 32 lowercase hex characters'
+    return None
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -165,6 +211,20 @@ class SignalBroadcast(BaseModel):
     trend_strength: Optional[float] = None
     volatility: Optional[float] = None
     notes: Optional[str] = None
+    master_trade_id: Optional[str] = None  # T1 CLOSE protocol 2: the master's trade id (32 lowercase hex)
+    protocol: int = 1                      # 1 = legacy entry, 2 = carries master_trade_id
+
+
+class CloseBroadcast(BaseModel):
+    """T1 CLOSE (protocol 2, spec 19.3) from the master: close every follower position opened from that entry.
+    Built only after close_guard.validate_close_payload accepted the raw JSON (strict types, 422 otherwise)."""
+    protocol: int
+    action: str
+    master_trade_id: str
+    symbol: str
+    side: str           # side of the ENTRY being closed: BUY | SELL
+    reason: str         # 'time_exit'
+    master_closed_ms: int
 
 
 class TradeReport(BaseModel):
@@ -287,38 +347,68 @@ async def broadcast_signal(
                                                signal.take_profit, signal.leverage, signal.risk_pct)
     if err:
         raise HTTPException(status_code=422, detail=err)
+    v2_err = _entry_v2_error(signal)   # T1 CLOSE protocol 2 fields, also before any DB write
+    if v2_err:
+        raise HTTPException(status_code=422, detail=v2_err)
     try:
         # Generate signal ID
         signal_id = secrets.token_urlsafe(16)
-        
-        # Store signal in database
-        db_signal = Signal(
-            signal_id=signal_id,
-            action=signal.action,
-            symbol=signal.symbol,
-            entry_price=signal.entry_price,
-            stop_loss=signal.stop_loss,
-            take_profit=signal.take_profit,
-            leverage=signal.leverage,
-            risk_pct=signal.risk_pct,
-            timeframe=signal.timeframe,
-            trend_strength=signal.trend_strength,
-            volatility=signal.volatility,
-            notes=signal.notes
-        )
-        db.add(db_signal)
-        db.commit()
-        db.refresh(db_signal)
-        
+
+        if signal.master_trade_id is not None:
+            # Protocol 2: idempotent on master_trade_id (partial unique index); a repeat makes no signal and
+            # no deliveries
+            signal_pk = db.execute(text(SQL_SIGNAL_V2_INSERT), {
+                'signal_id': signal_id, 'action': signal.action, 'symbol': signal.symbol,
+                'entry_price': signal.entry_price, 'stop_loss': signal.stop_loss,
+                'take_profit': signal.take_profit, 'leverage': signal.leverage, 'risk_pct': signal.risk_pct,
+                'timeframe': signal.timeframe, 'trend_strength': signal.trend_strength,
+                'volatility': signal.volatility, 'notes': signal.notes, 'created_at': datetime.utcnow(),
+                'master_trade_id': signal.master_trade_id}).scalar()
+            if signal_pk is None:
+                first_id = db.execute(text("SELECT signal_id FROM signals WHERE master_trade_id = :m"),
+                                      {'m': signal.master_trade_id}).scalar()
+                db.commit()
+                logger.info(f"📡 Duplicate v2 entry {signal.master_trade_id}: no new signal, no deliveries")
+                return {
+                    "status": "success",
+                    "duplicate": True,
+                    "signal_id": first_id,
+                    "master_trade_id": signal.master_trade_id,
+                    "delivered_to": 0,
+                    "expires_in_minutes": SIGNAL_EXPIRATION_MINUTES,
+                    "timestamp": datetime.utcnow().isoformat()
+                }
+            db.commit()
+        else:
+            # Store signal in database
+            db_signal = Signal(
+                signal_id=signal_id,
+                action=signal.action,
+                symbol=signal.symbol,
+                entry_price=signal.entry_price,
+                stop_loss=signal.stop_loss,
+                take_profit=signal.take_profit,
+                leverage=signal.leverage,
+                risk_pct=signal.risk_pct,
+                timeframe=signal.timeframe,
+                trend_strength=signal.trend_strength,
+                volatility=signal.volatility,
+                notes=signal.notes
+            )
+            db.add(db_signal)
+            db.commit()
+            db.refresh(db_signal)
+            signal_pk = db_signal.id
+
         # Get all active users
         active_users = db.query(User).filter(
             User.access_granted == True
         ).all()
-        
+
         # Create delivery records
         for user in active_users:
             delivery = SignalDelivery(
-                signal_id=db_signal.id,
+                signal_id=signal_pk,
                 user_id=user.id
             )
             db.add(delivery)
@@ -340,6 +430,67 @@ async def broadcast_signal(
     except Exception as e:
         logger.error(f"❌ Error broadcasting signal: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/api/broadcast-close")
+async def broadcast_close(
+    request: Request,
+    db: Session = Depends(get_db),
+    _: bool = Depends(verify_master_key)
+):
+    """
+    T1 CLOSE (protocol 2, spec 19.3/19.6): the master's 168 h time exit. Records the close once (master_closes,
+    idempotent on master_trade_id) and one close_jobs row per matched position, in one transaction; the trading
+    loop's process_close_jobs() executes them. No SignalDelivery and no 15-minute expiry.
+
+    Auth: MASTER_API_KEY (503 unset, 401 wrong). Payload: close_guard.validate_close_payload -> 422 before any
+    DB write. 200 {"accepted": true, "duplicate": false|true, "followers_matched": n} (a repeat answers the
+    first receipt's n).
+    """
+    log = _close_log()
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    err = close_guard.validate_close_payload(body, close_known_symbols(), _now_ms())
+    if err:
+        mid = body.get('master_trade_id') if isinstance(body, dict) else None
+        log.emit(close_guard.EV_PAYLOAD_REJECTED, master_trade_id=mid if close_guard.is_master_trade_id(mid) else None,
+                 reason=err)
+        raise HTTPException(status_code=422, detail=err)
+    close = CloseBroadcast(**{k: body[k] for k in CloseBroadcast.model_fields})
+    now = datetime.utcnow()
+    try:
+        inserted = db.execute(text(SQL_MASTER_CLOSE_INSERT), {
+            'm': close.master_trade_id, 'symbol': close.symbol, 'side': close.side, 'reason': close.reason,
+            'closed_ms': close.master_closed_ms, 'now': now}).scalar()
+        if inserted is None:
+            n_first = db.execute(text("SELECT matched FROM master_closes WHERE master_trade_id = :m"),
+                                 {'m': close.master_trade_id}).scalar()
+            db.commit()
+            log.emit(close_guard.EV_DUPLICATE, master_trade_id=close.master_trade_id,
+                     followers_matched=int(n_first or 0))
+            return {"accepted": True, "duplicate": True, "followers_matched": int(n_first or 0)}
+        jobs = [dict(r._mapping) for r in db.execute(text(SQL_CLOSE_JOBS_INSERT),
+                                                     {'m': close.master_trade_id, 'now': now}).fetchall()]
+        db.execute(text("UPDATE master_closes SET matched = :n WHERE master_trade_id = :m"),
+                   {'n': len(jobs), 'm': close.master_trade_id})
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.error(f"❌ Error recording CLOSE {close.master_trade_id}: {e}")
+        log.emit('CLOSE_RECEIVE_ERROR', severity='error', master_trade_id=close.master_trade_id, error=repr(e)[:300])
+        raise HTTPException(status_code=500, detail="close not recorded")
+
+    log.emit(close_guard.EV_RECEIVED, master_trade_id=close.master_trade_id, symbol=close.symbol, side=close.side,
+             reason=close.reason, master_closed_ms=close.master_closed_ms, followers_matched=len(jobs),
+             matched_rows=jobs)
+    for job in jobs:
+        log.emit(close_guard.EV_JOB_CREATED, master_trade_id=close.master_trade_id, **job)
+    if not jobs:
+        log.emit(close_guard.EV_NO_MATCH, master_trade_id=close.master_trade_id, symbol=close.symbol)
+    logger.info(f"📡 CLOSE {close.master_trade_id} ({close.reason}) on {close.symbol}: {len(jobs)} position(s) matched")
+    return {"accepted": True, "duplicate": False, "followers_matched": len(jobs)}
 
 
 @router.get("/api/latest-signal")

@@ -11,8 +11,9 @@ There is no GitHub Actions: this command is the gate.
 4. pytest over the explicit DB-free list with a junit report; FAIL on any failure, error, skip or xfail, or a
    listed module that ran 0 tests (tests/test_billing_integration.py stays out: asyncpg + TEST_DATABASE_URL);
 5. newline-normalised sha256 of the shared files: bracket_guard.py + tests/test_bracket_guard.py against
-   ../massive-rocket-algos and ../kraken-nike-rocket-api; follower_guard.py, signal_guard.py and
-   tests/test_follower_common.py against ../kraken-nike-rocket-api. A missing sibling repo is a FAIL.
+   ../massive-rocket-algos and ../kraken-nike-rocket-api; follower_guard.py, signal_guard.py,
+   tests/test_follower_common.py, close_guard.py and tests/test_close_common.py against ../kraken-nike-rocket-api;
+   tests/fixtures/close_v2.json against both (T1 CLOSE contract v2). A missing sibling repo is a FAIL.
 The pytest child runs with gate_env(): production variables removed (QC security-6); tests/conftest.py blocks
 every non-loopback connection.
 Writes gate_logs/junit_<UTC>.xml and gate_logs/gates_<UTC>.log; prints GATES PASS|FAIL; exits 0|1.
@@ -33,20 +34,25 @@ GATE_DEPS = ('pytest', 'pytest_asyncio', 'pytest_mock', 'fastapi', 'pydantic', '
              'httpx', 'cryptography', 'aiohttp', 'requests')
 MODULES = ('hosted_trading_loop.py', 'order_utils.py', 'position_guardian.py', 'position_monitor.py',
            'follower_endpoints.py', 'main.py', 'bracket_guard.py', 'follower_guard.py', 'signal_guard.py',
-           'hl_rate.py')
+           'hl_rate.py', 'close_guard.py')
 TESTS = ('test_bracket_guard', 'test_follower_common', 'test_emergency_close_and_bracket', 'test_position_guardian',
-         'test_hl_rate', 'test_fail_closed_and_bounds', 'test_endpoint_static', 'test_post_entry_recovery')
+         'test_hl_rate', 'test_fail_closed_and_bounds', 'test_endpoint_static', 'test_post_entry_recovery',
+         'test_close_common', 'test_master_close')
 SHARED = (('bracket_guard.py', ('massive-rocket-algos', 'kraken-nike-rocket-api')),
           ('tests/test_bracket_guard.py', ('massive-rocket-algos', 'kraken-nike-rocket-api')),
           ('follower_guard.py', ('kraken-nike-rocket-api',)),
           ('signal_guard.py', ('kraken-nike-rocket-api',)),
-          ('tests/test_follower_common.py', ('kraken-nike-rocket-api',)))
+          ('tests/test_follower_common.py', ('kraken-nike-rocket-api',)),
+          ('close_guard.py', ('kraken-nike-rocket-api',)),
+          ('tests/test_close_common.py', ('kraken-nike-rocket-api',)),
+          ('tests/fixtures/close_v2.json', ('kraken-nike-rocket-api', 'massive-rocket-algos')))
 
 
 # QC security-6: the pytest child never sees production variables (tests/conftest.py also blocks the network)
 SCRUB_ENV = ('DATABASE_URL', 'RESEND_API_KEY', 'MASTER_API_KEY', 'ADMIN_PASSWORD', 'CREDENTIALS_ENCRYPTION_KEY',
              'GUARDIAN_MODE', 'HL_WEIGHT_CEILING', 'HL_GUARDIAN_WEIGHT_PER_MIN', 'USE_TESTNET', 'ADMIN_EMAIL',
-             'COINBASE_COMMERCE_API_KEY', 'COINBASE_COMMERCE_WEBHOOK_SECRET')
+             'COINBASE_COMMERCE_API_KEY', 'COINBASE_COMMERCE_WEBHOOK_SECRET',
+             'CLOSE_JOBS_ENABLED', 'CLOSE_SKIP_INACTIVE_USERS', 'CLOSE_KNOWN_SYMBOLS')
 SCRUB_PREFIXES = ('CHAOS_',)
 
 

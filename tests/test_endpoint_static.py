@@ -49,6 +49,38 @@ def test_sec2_master_key_has_no_default_and_is_compared_in_constant_time():
     assert 'status_code=503' in ast.unparse(fn) and 'status_code=401' in ast.unparse(fn)
 
 
+# ---------------------------------------------------------------- T07: POST /api/broadcast-close (spec 19.6)
+def test_broadcast_close_route_requires_the_master_key():
+    tree = _tree()
+    fn = _func(tree, 'broadcast_close')
+    routes = [ast.unparse(d) for d in fn.decorator_list]
+    assert routes == ["router.post('/api/broadcast-close')"]
+    defaults = [ast.unparse(d) for d in fn.args.defaults + fn.args.kw_defaults if d is not None]
+    assert 'Depends(verify_master_key)' in defaults
+
+
+def test_broadcast_close_validates_with_close_guard_before_any_db_write():
+    fn = _func(_tree(), 'broadcast_close')
+    calls = [(n.lineno, ast.unparse(n.func)) for n in ast.walk(fn) if isinstance(n, ast.Call)]
+    validate = min(line for line, name in calls if name == 'close_guard.validate_close_payload')
+    db_calls = [line for line, name in calls if name.startswith('db.')]
+    assert db_calls and validate < min(db_calls)
+    raises = [n for n in ast.walk(fn) if isinstance(n, ast.Raise) and 'status_code=422' in ast.unparse(n)]
+    assert raises and min(r.lineno for r in raises) < min(db_calls)
+
+
+def test_broadcast_signal_checks_the_v2_fields_before_its_try():
+    fn = _func(_tree(), 'broadcast_signal')
+    body = fn.body[1:] if isinstance(fn.body[0], ast.Expr) and isinstance(fn.body[0].value, ast.Constant) else fn.body
+    try_index = next(i for i, s in enumerate(body) if isinstance(s, ast.Try))
+    before = ast.unparse(ast.Module(body=body[:try_index], type_ignores=[]))
+    assert '_entry_v2_error(signal)' in before and before.count('status_code=422') == 2
+    cls = next(n for n in ast.walk(_tree()) if isinstance(n, ast.ClassDef) and n.name == 'SignalBroadcast')
+    fields = {s.target.id: (ast.unparse(s.annotation), ast.unparse(s.value) if s.value else None)
+              for s in cls.body if isinstance(s, ast.AnnAssign)}
+    assert fields['master_trade_id'] == ('Optional[str]', 'None') and fields['protocol'] == ('int', '1')
+
+
 # ---------------------------------------------------------------- SEC-3 (QC security-2): the admin password
 def _main_tree():
     with open(os.path.join(ROOT, 'main.py'), encoding='utf-8') as f:

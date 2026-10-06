@@ -57,6 +57,17 @@ accounts**. FastAPI, deployed on **Railway** (`railway.json`). **Postgres-backed
   and the lane only charge. HL's own limit is 1200/min per IP.
 - Shared Wave 1 modules: `bracket_guard.py` (byte-identical to `massive-rocket-algos`), `follower_guard.py`
   and `signal_guard.py` (byte-identical to `kraken-nike-rocket-api`). Never edit one copy alone.
+- **T1 CLOSE (protocol 2, branch `claude/t1-close`; spec massive-rocket-algos
+  `docs/superpowers/specs/2026-10-06-t1-live-design.md` s19):** the master's 168 h time exit reaches followers as
+  `POST /api/broadcast-close` (master key; `close_guard.validate_close_payload` -> 422 before any write). Receipt is
+  idempotent (`master_closes` PK = `master_trade_id`) and creates one `close_jobs` row per matched position; matching
+  is ONLY `open_positions.signal_id -> signals.master_trade_id` (v2 entries carry the id; NULL/legacy rows are never
+  touched). `HostedTradingLoop.process_close_jobs()` runs them every loop cycle BEFORE the signal poll, under the
+  user's in-flight token: TP cancel by id -> `exit_hint='TIME'` -> reduce-only close of min(venue, row remainder)
+  -> verify flat -> `close_fill_qty` += fill -> SL cancel by id. `position_monitor` labels the exit `TIME` only with
+  `exit_hint='TIME'` and `close_fill_qty > 0`. `close_guard.py` + `tests/test_close_common.py` are byte-identical with
+  Kraken; `tests/fixtures/close_v2.json` with Kraken and the master. Events: `logs/close_events.jsonl` + logger
+  `close_events`.
 - `config.py` — fee tiers + `utc_now()` / `ensure_utc_aware()` tz helpers.
 - HTML: `setup.html`, `signup.html`, `login.html`; the dashboard is inline in `main.py`.
 
@@ -92,6 +103,13 @@ accounts**. FastAPI, deployed on **Railway** (`railway.json`). **Postgres-backed
 9. **HL SDK shapes:** `open_orders()` has no `reduceOnly` and returns int oids; read legs with
    `frontend_open_orders` and compare oids as str. An envelope `status='ok'` does not mean filled: check
    `statuses[0]`, and prove a close with a flat re-read.
+10. **T1 CLOSE switches:** `CLOSE_JOBS_ENABLED=0` = kill switch (the endpoint still records closes + jobs; set
+   back to 1 to run the backlog; jobs older than 24 h expire with `CLOSE_JOB_EXPIRED`). Default closes stopped/unpaid/
+   no-access users too (a CLOSE only removes risk); `CLOSE_SKIP_INACTIVE_USERS=1` skips them (job `skipped` + alarm).
+   `CLOSE_KNOWN_SYMBOLS` (default `ADA/USDT`) lists the symbols a CLOSE may name. A `pending` close job, or one
+   `done` < 180 s ago, makes the guardian treat the user as busy; a `deferred` one (row `needs_recovery`) does NOT
+   (the recovery lane must stay free to resolve it). Before rolling back below `claude/t1-close`, resolve every
+   `SELECT * FROM close_jobs WHERE status IN ('pending','deferred')` by hand; the new columns/tables are additive.
 
 ## Gates (this repo)
 - `pip install -r requirements-gate.txt` (CPython 3.13; not the production set), then `python tools/run_gates.py`
@@ -108,4 +126,5 @@ accounts**. FastAPI, deployed on **Railway** (`railway.json`). **Postgres-backed
 - Timezone-aware datetimes everywhere expiry/billing is compared (naive stored = UTC).
 
 ## History
-See `docs/progress/` (e.g. `2026-08-10-api-wallet-expiry-surfacing.md`, `2026-09-28-wave1-phase0-safety.md`).
+See `docs/progress/` (e.g. `2026-08-10-api-wallet-expiry-surfacing.md`, `2026-09-28-wave1-phase0-safety.md`,
+`2026-10-07-t1-close.md`).
