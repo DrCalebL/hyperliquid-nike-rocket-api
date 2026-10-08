@@ -268,10 +268,25 @@ CLOSE_CRITICAL_NOTIFY = frozenset({close_guard.EV_SIDE_MISMATCH, close_guard.EV_
                                    close_guard.EV_JOB_EXPIRED, close_guard.EV_RESIDUAL})
 
 
+_FLAG_TRUE = ('1', 'true', 'yes', 'on')
+_FLAG_FALSE = ('0', 'false', 'no', 'off')
+
+
+def _close_env_flag(name: str, default: bool) -> bool:
+    """A close-path switch: 1/true/yes/on or 0/false/no/off (any case, spaces ignored); anything else = default.
+    The same words as the Kraken follower's _env_flag (QC review 4 #7: 'false' must also stop close jobs)."""
+    v = (os.getenv(name) or '').strip().lower()
+    if v in _FLAG_TRUE:
+        return True
+    if v in _FLAG_FALSE:
+        return False
+    return default
+
+
 def close_flags() -> Dict:
     """The close-path env flags (logged once at the first cycle; their sha is in every close event)."""
-    return {'CLOSE_JOBS_ENABLED': (os.getenv('CLOSE_JOBS_ENABLED') or '1').strip() != '0',
-            'CLOSE_SKIP_INACTIVE_USERS': (os.getenv('CLOSE_SKIP_INACTIVE_USERS') or '0').strip() == '1'}
+    return {'CLOSE_JOBS_ENABLED': _close_env_flag('CLOSE_JOBS_ENABLED', True),
+            'CLOSE_SKIP_INACTIVE_USERS': _close_env_flag('CLOSE_SKIP_INACTIVE_USERS', False)}
 
 
 _CLOSE_LOG = None
@@ -1242,11 +1257,13 @@ class HostedTradingLoop:
                                              source='trading')
         after, err = await self._close_read(info, wallet, coin)
         filled = min(meter.filled, step.qty)
-        if meter.unknown:                       # a 'filled' without totalSz: estimate from the position, never low
+        if meter.unknown:                       # a 'filled' without totalSz: measure it from the position re-read
             if isinstance(after, bg.Pos) and after.side == (-1 if is_buy_to_close else 1):
                 filled = max(filled, min(step.qty, max(0.0, (step.venue_qty or 0) - after.qty)))
-            else:
+            elif after is None:                 # verified flat: everything sent was filled
                 filled = step.qty
+            # a failed re-read: the fill is unknown, so nothing more is recorded (an over-count would mark the row
+            # share closed and the next attempt would cancel the SL of a still-open position); the job retries
         self._close_step(job, 'close', qty=step.qty, exit_side=step.exit_side, reduce_only=True,
                          residual=step.residual, filled=filled, fill_unknown=meter.unknown)
         if filled > 0:

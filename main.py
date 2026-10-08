@@ -397,7 +397,7 @@ if DATABASE_URL:
             conn.commit()
         except Exception as e:
             conn.rollback()
-            print(f"⚠️ T1 CLOSE migration failed (close jobs stay inert): {e}")
+            print(f"⚠️ T1 CLOSE migration failed - the new signals column may be missing, which breaks every signals query (legacy delivery too): fix the schema before trading: {e}")
 
         conn.commit()
         cur.close()

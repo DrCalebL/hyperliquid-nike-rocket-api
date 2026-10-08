@@ -23,7 +23,7 @@ import follower_guard as fg  # noqa: E402
 FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fixtures', 'close_v2.json')
 # Newline-normalised sha256 of tests/fixtures/close_v2.json. The same constant in both follower copies of this file
 # plus the gates' sibling comparison pin the fixture byte-identical across the master and both followers.
-CLOSE_V2_SHA256 = 'adc28169a1bd06d70b8af7395250a8d715635e7e9e341f3f022701d6a7b2822e'
+CLOSE_V2_SHA256 = 'cedf126d058c497105b30160ec0f38b47c0f8cbd89f15bb314b4642e31d76733'
 
 TID = '0123456789abcdef0123456789abcdef'
 LOT = 1.0

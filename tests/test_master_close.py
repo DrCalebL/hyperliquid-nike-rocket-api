@@ -383,6 +383,65 @@ async def test_kill_switch_records_nothing_executed_and_then_runs_the_backlog(lo
     assert db.job(row['id'])['status'] == 'done'
 
 
+@pytest.mark.parametrize('raw,enabled', [(None, True), ('', True), ('1', True), ('true', True), ('on', True),
+                                         ('yes', True), ('0', False), ('false', False), ('off', False),
+                                         ('no', False), ('FALSE', False), (' 0 ', False), ('junk', True)])
+def test_close_jobs_enabled_accepts_the_same_words_as_the_kraken_follower(monkeypatch, raw, enabled):
+    """QC (review 4 #7): 'false' / 'off' / 'no' must also stop close jobs (Kraken's _env_flag rules)."""
+    if raw is None:
+        monkeypatch.delenv('CLOSE_JOBS_ENABLED', raising=False)
+    else:
+        monkeypatch.setenv('CLOSE_JOBS_ENABLED', raw)
+    assert htl.close_flags()['CLOSE_JOBS_ENABLED'] is enabled
+
+
+@pytest.mark.parametrize('raw,skip', [(None, False), ('0', False), ('1', True), ('true', True), ('yes', True),
+                                      ('on', True), ('off', False), ('junk', False)])
+def test_close_skip_inactive_users_accepts_the_same_words(monkeypatch, raw, skip):
+    if raw is None:
+        monkeypatch.delenv('CLOSE_SKIP_INACTIVE_USERS', raising=False)
+    else:
+        monkeypatch.setenv('CLOSE_SKIP_INACTIVE_USERS', raw)
+    assert htl.close_flags()['CLOSE_SKIP_INACTIVE_USERS'] is skip
+
+
+async def test_an_unmeasured_fill_with_a_failed_reread_records_no_fill(loop, db, venue, creds, monkeypatch):
+    """QC (review 2 #3): a 'filled' without totalSz plus a failed re-read is an UNKNOWN fill: record nothing and
+    retry (counting the full qty would mark the row share closed and cancel the SL of a still-open position)."""
+    row, sl, tp, mid = arm(db, venue, creds)
+    real_read = loop._close_read
+    n = {'reads': 0}
+
+    async def read(info, w, coin):
+        n['reads'] += 1
+        if n['reads'] == 3:                                  # the read right after the close
+            return bg.UNKNOWN, 'RuntimeError: 502'
+        return await real_read(info, w, coin)
+
+    async def partial_close(meter, info, w, coin, is_buy, sz, round_price, source=None):
+        venue.set_position(w, coin, 40.0, 0.5)               # 60 of 100 filled, the fill size is not reported
+        meter.unknown = True
+        return {}
+    monkeypatch.setattr(loop, '_close_read', read)
+    monkeypatch.setattr(htl, 'hl_close_with_verification', partial_close)
+    await loop.process_close_jobs()
+    assert not db.positions[row['id']]['close_fill_qty']
+    assert db.job(row['id'])['status'] == 'pending'
+    assert sl in {o['oid'] for o in venue.orders(wallet(7))}           # the SL stays (I3)
+
+
+async def test_an_unmeasured_fill_on_a_flat_reread_counts_the_close(loop, db, venue, creds, monkeypatch):
+    row, sl, tp, mid = arm(db, venue, creds)
+
+    async def full_close(meter, info, w, coin, is_buy, sz, round_price, source=None):
+        venue.set_position(w, coin, 0.0, 0.5)
+        meter.unknown = True
+        return {}
+    monkeypatch.setattr(htl, 'hl_close_with_verification', full_close)
+    await loop.process_close_jobs()
+    assert db.positions[row['id']]['close_fill_qty'] == 100.0 and db.job(row['id'])['status'] == 'done'
+
+
 @pytest.mark.parametrize('user_kw', [{'agent_active': False}, {'access_granted': False},
                                      {'pending_invoice_id': 'inv_1',
                                       'invoice_due_date': datetime(2020, 1, 1)}])

@@ -52,7 +52,7 @@
     {"name": "symbol_empty", "expect": 422, "field": "symbol",
      "payload": {"protocol": 2, "action": "CLOSE", "master_trade_id": "0123456789abcdef0123456789abcdef", "symbol": "", "side": "BUY", "reason": "time_exit", "master_closed_ms": 1760000000000}},
     {"name": "symbol_unknown", "expect": 422, "field": "symbol",
-     "payload": {"protocol": 2, "action": "CLOSE", "master_trade_id": "0123456789abcdef0123456789abcdef", "symbol": "DOGE/USDT", "side": "BUY", "reason": "time_exit", "master_closed_ms": 1760000000000}},
+     "payload": {"protocol": 2, "action": "CLOSE", "master_trade_id": "0123456789abcdef0123456789abcdef", "symbol": "ZZZ/USDT", "side": "BUY", "reason": "time_exit", "master_closed_ms": 1760000000000}},
     {"name": "symbol_venue_format", "expect": 422, "field": "symbol",
      "payload": {"protocol": 2, "action": "CLOSE", "master_trade_id": "0123456789abcdef0123456789abcdef", "symbol": "ADA", "side": "BUY", "reason": "time_exit", "master_closed_ms": 1760000000000}},
     {"name": "side_lowercase", "expect": 422, "field": "side",
