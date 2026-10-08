@@ -5,7 +5,7 @@
 
 <!-- FULL-WORKFLOW:START -->
 ## Full workflow (Opus 5.5, multi-agent)
-Before each wave, reread root `CLAUDE.md`. The coordinator and every worker run Claude Opus 5.5 (`claude-opus-5-5`).
+Before each wave, reread root `CLAUDE.md`. The coordinator runs Claude Opus 5.5 (`claude-opus-5-5`). To save credits (owner 2026-10-08), builders, integrators/mergers and recon/explore agents run Sonnet 5.5 (`claude-sonnet-5-5`); planners and plan judges, adversarial reviewers (always the money-safety lens) and QC stay on Opus 5.5.
 Routine work: the coordinator builds, then one fresh, independent, read-only reviewer checks it.
 "Full workflow" (high-risk or explicitly requested) runs five stages in order, scaled to the task:
 1. **Plan** — several independent planners converge on an exact consensus spec BEFORE any code.
