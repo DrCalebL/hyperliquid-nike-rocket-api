@@ -240,7 +240,8 @@ def exchange_ctor_takes_meta(cls=None) -> bool:
 # ==================== T1 CLOSE (protocol 2): master time-exit closes ====================
 # Spec: massive-rocket-algos docs/superpowers/specs/2026-10-06-t1-live-design.md 19.6-19.8 and 21.
 # POST /api/broadcast-close records master_closes + one close_jobs row per matched position; process_close_jobs()
-# runs them each loop cycle BEFORE the signal poll. Kill switch CLOSE_JOBS_ENABLED=0 (jobs wait, nothing lost);
+# runs them each loop cycle BEFORE the signal poll. Kill switch CLOSE_JOBS_ENABLED=0 (jobs wait; spec 21:
+# a job older than 24 h from created_at expires with an alarm when the switch goes back to 1);
 # CLOSE_SKIP_INACTIVE_USERS=1 skips stopped/unpaid/no-access users (default: a CLOSE only removes risk, so it
 # reaches every matched row whose credentials decrypt).
 CLOSE_VENUE = 'hyperliquid'
@@ -1129,7 +1130,8 @@ class HostedTradingLoop:
 
     async def process_close_jobs(self) -> int:
         """Run every pending/deferred close job once, in 25-job gather batches. Returns the number of jobs run;
-        0 while CLOSE_JOBS_ENABLED=0 (the endpoint still records closes and jobs, so nothing is lost)."""
+        0 while CLOSE_JOBS_ENABLED=0 (the endpoint still records closes and jobs; a job older than 24 h from
+        created_at expires, with CLOSE_JOB_EXPIRED, on the first cycle after the switch is back on)."""
         flags = close_flags()
         if not getattr(self, '_close_config_logged', False):
             self._close_config_logged = True
